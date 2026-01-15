@@ -367,22 +367,31 @@ def write_rows_to_excel(xlsx_in: Path, xlsx_out: Path, rows: List[CompanyRow]) -
 
 def main() -> None:
     if not UNIVERSE_INPUT.exists():
-    raise FileNotFoundError(f"Missing {UNIVERSE_INPUT}. Provide a .csv or .xlsx universe input.")
+        raise FileNotFoundError(
+            f"Missing {UNIVERSE_INPUT}. Provide a .csv or .xlsx universe input."
+        )
     if not TEMPLATE_XLSX.exists():
-        raise FileNotFoundError(f"Missing {TEMPLATE_XLSX}. Put your Excel template there.")
+        raise FileNotFoundError(
+            f"Missing {TEMPLATE_XLSX}. Put your Excel template there."
+        )
     if not SIC_CONFIG.exists():
-        raise FileNotFoundError(f"Missing {SIC_CONFIG}. Put sic_allowlist JSON there.")
+        raise FileNotFoundError(
+            f"Missing {SIC_CONFIG}. Put sic_allowlist JSON there."
+        )
 
     sic_allow = load_sic_allowlist(SIC_CONFIG)
-    tickers = load_tickers_any(UNIVERSE_INPUT, sheet_name=UNIVERSE_SHEET, ticker_header=UNIVERSE_TICKER_HEADER)
-    t2c = build_ticker_to_cik_map()
+    tickers = load_tickers_any(
+        UNIVERSE_INPUT,
+        sheet_name=UNIVERSE_SHEET,
+        ticker_header=UNIVERSE_TICKER_HEADER,
+    )
 
+    t2c = build_ticker_to_cik_map()
     out_rows: List[CompanyRow] = []
     as_of = date.today().isoformat()
 
     for t in tickers:
         if t not in t2c:
-            # skip unknown tickers (could be non-SEC filer)
             continue
 
         cik10, name = t2c[t]
@@ -402,9 +411,9 @@ def main() -> None:
             )
         )
 
-    # Write into the Excel template
     write_rows_to_excel(TEMPLATE_XLSX, OUTPUT_XLSX, out_rows)
     print(f"Wrote {len(out_rows)} rows to {OUTPUT_XLSX}")
+
 
 if __name__ == "__main__":
     main()

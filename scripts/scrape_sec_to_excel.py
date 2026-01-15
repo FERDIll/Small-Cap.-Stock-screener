@@ -44,8 +44,7 @@ SIC_CONFIG = REPO_ROOT / "config" / "sic_aero_defense.json"
 SEC_COMPANY_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL_TMPL = "https://data.sec.gov/submissions/CIK{cik10}.json"
 
-# IMPORTANT: Put real contact info here (SEC expects identifiable User-Agent).
-USER_AGENT = "YourName YourProject (your.email@example.com)"
+USER_AGENT = "FERDIll Small-Cap.-Stock-screener (Niggemeier.Ferdinand@gmail.com)"
 
 # Rate limiting: keep it conservative for a manual monthly run
 SECONDS_BETWEEN_REQUESTS = 0.2

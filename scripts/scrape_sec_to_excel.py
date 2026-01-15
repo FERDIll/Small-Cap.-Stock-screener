@@ -35,7 +35,11 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-UNIVERSE_CSV = REPO_ROOT / "data" / "universe.csv"
+# Can be either a .csv or a .xlsx
+UNIVERSE_INPUT = REPO_ROOT / "data" / "universe.csv"
+# If UNIVERSE_INPUT is .xlsx, tickers are read from this sheet:
+UNIVERSE_SHEET = "Universe"
+UNIVERSE_TICKER_HEADER = "ticker"  # case-insensitive
 TEMPLATE_XLSX = REPO_ROOT / "data" / "defense_screening_prototype_v1.xlsx"
 OUTPUT_XLSX = TEMPLATE_XLSX  # set to REPO_ROOT/"data"/"output.xlsx" if you want a separate file
 SIC_CONFIG = REPO_ROOT / "config" / "sic_aero_defense.json"
@@ -129,6 +133,107 @@ class CompanyRow:
     sic_desc: Optional[str]
     is_aero_defense: bool
     data_as_of: str  # ISO date string
+
+def load_tickers_from_csv(path: Path) -> List[str]:
+    """
+    Accepts:
+    - one-column CSV with header 'ticker'
+    - or a CSV with first column as tickers
+    """
+    tickers: List[str] = []
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames and any(fn.lower() == "ticker" for fn in reader.fieldnames):
+            for row in reader:
+                t = (row.get("ticker") or "").strip().upper()
+                if t:
+                    tickers.append(t)
+        else:
+            f.seek(0)
+            raw = csv.reader(f)
+            for r in raw:
+                if not r:
+                    continue
+                t = (r[0] or "").strip().upper()
+                if t and t != "TICKER":
+                    tickers.append(t)
+
+    seen = set()
+    out = []
+    for t in tickers:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def load_tickers_from_xlsx(path: Path, sheet_name: str = "Universe", ticker_header: str = "ticker") -> List[str]:
+    """
+    Reads tickers from an XLSX sheet. Expects a header row containing 'Ticker' (case-insensitive).
+    """
+    wb = load_workbook(path, read_only=True, data_only=True)
+    if sheet_name not in wb.sheetnames:
+        raise RuntimeError(f"Sheet '{sheet_name}' not found in {path}")
+
+    ws = wb[sheet_name]
+
+    # Find header row in first 20 rows (in case you have title rows)
+    def norm(s: str) -> str:
+        return " ".join(s.strip().lower().split())
+
+    header_row = None
+    header_map: Dict[str, int] = {}
+
+    for r in range(1, min(20, ws.max_row) + 1):
+        row_map: Dict[str, int] = {}
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(row=r, column=c).value
+            if isinstance(v, str) and v.strip():
+                row_map[norm(v)] = c
+        if norm(ticker_header) in row_map:
+            header_row = r
+            header_map = row_map
+            break
+
+    if header_row is None:
+        raise RuntimeError(f"Could not find a '{ticker_header}' column in sheet '{sheet_name}' of {path}")
+
+    ticker_col = header_map[norm(ticker_header)]
+
+    tickers: List[str] = []
+    for r in range(header_row + 1, ws.max_row + 1):
+        v = ws.cell(row=r, column=ticker_col).value
+        if v is None:
+            continue
+        t = str(v).strip().upper()
+        if t:
+            tickers.append(t)
+
+    seen = set()
+    out = []
+    for t in tickers:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+
+    return out
+
+
+def load_tickers_any(path: Path, sheet_name: str = "Universe", ticker_header: str = "ticker") -> List[str]:
+    """
+    Auto-detect .csv vs .xlsx and load tickers accordingly.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Missing universe input: {path}")
+
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return load_tickers_from_csv(path)
+    if suffix in (".xlsx", ".xlsm", ".xltx", ".xltm"):
+        return load_tickers_from_xlsx(path, sheet_name=sheet_name, ticker_header=ticker_header)
+
+    raise ValueError(f"Unsupported universe input type: {path} (expected .csv or .xlsx)")
+
 
 
 def build_ticker_to_cik_map() -> Dict[str, Tuple[str, str]]:
@@ -261,15 +366,15 @@ def write_rows_to_excel(xlsx_in: Path, xlsx_out: Path, rows: List[CompanyRow]) -
 # -----------------------------
 
 def main() -> None:
-    if not UNIVERSE_CSV.exists():
-        raise FileNotFoundError(f"Missing {UNIVERSE_CSV}. Create it with a 'ticker' column.")
+    if not UNIVERSE_INPUT.exists():
+    raise FileNotFoundError(f"Missing {UNIVERSE_INPUT}. Provide a .csv or .xlsx universe input.")
     if not TEMPLATE_XLSX.exists():
         raise FileNotFoundError(f"Missing {TEMPLATE_XLSX}. Put your Excel template there.")
     if not SIC_CONFIG.exists():
         raise FileNotFoundError(f"Missing {SIC_CONFIG}. Put sic_allowlist JSON there.")
 
     sic_allow = load_sic_allowlist(SIC_CONFIG)
-    tickers = load_tickers(UNIVERSE_CSV)
+    tickers = load_tickers_any(UNIVERSE_INPUT, sheet_name=UNIVERSE_SHEET, ticker_header=UNIVERSE_TICKER_HEADER)
     t2c = build_ticker_to_cik_map()
 
     out_rows: List[CompanyRow] = []

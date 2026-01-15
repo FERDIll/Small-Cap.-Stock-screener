@@ -273,7 +273,7 @@ def main() -> None:
         raise FileNotFoundError(f"Missing {SIC_CONFIG}. Put sic_allowlist JSON there.")
 
     sic_allow = load_sic_allowlist(SIC_CONFIG)
-    tickers = load_tickers(UNIVERSE_CSV)
+    tickers = load_tickers_from_xlsx(UNIVERSE_CSV, sheet_name="Universe")
     t2c = build_ticker_to_cik_map()
 
     out_rows: List[CompanyRow] = []

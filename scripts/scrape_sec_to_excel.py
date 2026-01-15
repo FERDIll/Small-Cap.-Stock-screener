@@ -3,7 +3,7 @@
 v1 SEC scraper: tickers -> CIK -> SIC -> write to Excel template.
 
 - Inputs:
-  - data/universe.csv (tickers)
+  - data/universe.xlsx (tickers)
   - config/sic_aero_defense.json (SIC allowlist)
   - data/defense_screening_prototype_v1.xlsx (template)
 
@@ -35,7 +35,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-UNIVERSE_CSV = REPO_ROOT / "data" / "universe.csv"
+UNIVERSE_CSV = REPO_ROOT / "data" / "universe.xlsx"
 TEMPLATE_XLSX = REPO_ROOT / "data" / "defense_screening_prototype_v1.xlsx"
 OUTPUT_XLSX = TEMPLATE_XLSX  # set to REPO_ROOT/"data"/"output.xlsx" if you want a separate file
 SIC_CONFIG = REPO_ROOT / "config" / "sic_aero_defense.json"
@@ -87,38 +87,41 @@ def load_sic_allowlist(path: Path) -> set[int]:
     cfg = json.loads(path.read_text(encoding="utf-8"))
     return set(int(x) for x in cfg.get("sic_allowlist", []))
 
-def load_tickers(path: Path) -> List[str]:
-    """
-    Accepts:
-    - one-column CSV with header 'ticker'
-    - or a CSV with first column as tickers
-    """
-    tickers: List[str] = []
-    with path.open("r", encoding="utf-8-sig", newline="") as f:
-        reader = csv.DictReader(f)
-        if reader.fieldnames and any(fn.lower() == "ticker" for fn in reader.fieldnames):
-            for row in reader:
-                t = (row.get("ticker") or "").strip().upper()
-                if t:
-                    tickers.append(t)
-        else:
-            # fallback: treat as simple CSV without header
-            f.seek(0)
-            raw = csv.reader(f)
-            for r in raw:
-                if not r:
-                    continue
-                t = (r[0] or "").strip().upper()
-                if t and t != "TICKER":
-                    tickers.append(t)
+from openpyxl import load_workbook
 
-    # de-dupe while preserving order
+def load_tickers_from_xlsx(path: Path, sheet_name: str = "Universe") -> List[str]:
+    wb = load_workbook(path, read_only=True)
+    if sheet_name not in wb.sheetnames:
+        raise RuntimeError(f"Sheet '{sheet_name}' not found in {path}")
+
+    ws = wb[sheet_name]
+
+    # find header row (assume row 1)
+    headers = {}
+    for col in range(1, ws.max_column + 1):
+        val = ws.cell(row=1, column=col).value
+        if isinstance(val, str):
+            headers[val.strip().lower()] = col
+
+    if "ticker" not in headers:
+        raise RuntimeError("No 'Ticker' column found in Excel file.")
+
+    ticker_col = headers["ticker"]
+
+    tickers = []
+    for row in range(2, ws.max_row + 1):
+        val = ws.cell(row=row, column=ticker_col).value
+        if val:
+            tickers.append(str(val).strip().upper())
+
+    # de-duplicate, preserve order
     seen = set()
     out = []
     for t in tickers:
         if t not in seen:
             seen.add(t)
             out.append(t)
+
     return out
 
 @dataclass

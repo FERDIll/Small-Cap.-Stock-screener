@@ -87,6 +87,19 @@ ENABLE_TIER_C = True
 def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
+import re
+
+TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,9}$")  # allows BRK.B, RDS-A, etc.
+
+def clean_ticker(raw: str) -> Optional[str]:
+    t = (raw or "").strip().upper()
+    if not t:
+        return None
+    if not TICKER_RE.match(t):
+        return None
+    return t
+
+
 def sleep_rate_limit() -> None:
     time.sleep(SECONDS_BETWEEN_REQUESTS)
 
@@ -172,16 +185,16 @@ def load_tickers_from_csv(path: Path) -> List[str]:
         reader = csv.DictReader(f)
         if reader.fieldnames and any(fn and fn.strip().lower() == "ticker" for fn in reader.fieldnames):
             for row in reader:
-                t = (row.get("ticker") or "").strip().upper()
-                if t:
-                    tickers.append(t)
+                    t = clean_ticker(row.get("ticker") or "")
+                    if t:
+                        tickers.append(t)
         else:
             f.seek(0)
             raw = csv.reader(f)
             for r in raw:
                 if not r:
                     continue
-                t = (r[0] or "").strip().upper()
+                t = clean_ticker(r[0] if r else "")
                 if t and t != "TICKER":
                     tickers.append(t)
     return dedupe_preserve_order(tickers)
@@ -217,9 +230,10 @@ def load_tickers_from_xlsx(path: Path, sheet_name: str, ticker_header: str) -> L
         v = ws.cell(row=r, column=tcol).value
         if v is None:
             continue
-        t = str(v).strip().upper()
+        t = clean_ticker(str(v))
         if t:
             tickers.append(t)
+
 
     return dedupe_preserve_order(tickers)
 

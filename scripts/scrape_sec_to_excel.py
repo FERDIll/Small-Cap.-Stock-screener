@@ -21,7 +21,7 @@ import json
 import time
 import zipfile
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from xml.etree import ElementTree as ET
@@ -85,7 +85,7 @@ ENABLE_TIER_C = True
 # -----------------------------
 
 def now_iso() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 def sleep_rate_limit() -> None:
     time.sleep(SECONDS_BETWEEN_REQUESTS)

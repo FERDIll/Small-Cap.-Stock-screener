@@ -185,9 +185,9 @@ def load_tickers_from_csv(path: Path) -> List[str]:
         reader = csv.DictReader(f)
         if reader.fieldnames and any(fn and fn.strip().lower() == "ticker" for fn in reader.fieldnames):
             for row in reader:
-                    t = clean_ticker(row.get("ticker") or "")
-                    if t:
-                        tickers.append(t)
+                t = clean_ticker(row.get("ticker") or "")
+                if t:
+                    tickers.append(t)
         else:
             f.seek(0)
             raw = csv.reader(f)
@@ -299,6 +299,36 @@ def get_text(url: str, cache_key: str) -> Optional[str]:
         return text
     except Exception:
         return None
+
+import csv as _csv
+from io import StringIO
+
+def yahoo_close_on_date(ticker: str, target_date: date) -> Optional[float]:
+    """
+    Fetch daily close price from Yahoo Finance CSV for a given date.
+    No API key. Best-effort. Returns None if unavailable.
+    """
+    # small buffer so weekends/holidays don’t break it
+    period1 = int(time.mktime((target_date - timedelta(days=5)).timetuple()))
+    period2 = int(time.mktime((target_date + timedelta(days=1)).timetuple()))
+
+    url = (
+        f"https://query1.finance.yahoo.com/v7/finance/download/{ticker}"
+        f"?period1={period1}&period2={period2}&interval=1d&events=history"
+    )
+
+    try:
+        r = requests.get(url, headers=_http_headers(), timeout=20)
+        sleep_rate_limit()
+        r.raise_for_status()
+        reader = _csv.DictReader(StringIO(r.text))
+        for row in reader:
+            if row.get("Date") == target_date.isoformat():
+                return float(row.get("Close"))
+    except Exception:
+        return None
+
+    return None
 
 def build_ticker_to_cik_map() -> Dict[str, Tuple[str, str]]:
     data = get_json_cached(SEC_COMPANY_TICKERS_URL, cache_key="company_tickers")
@@ -1063,6 +1093,26 @@ def main() -> None:
                     if facts:
                         a = tier_a_metrics(facts)
                         out.update(a)
+                                                # Tier P: Market cap (price × shares outstanding)
+                        try:
+                            shares = safe_float(out.get("A_Shares_Outstanding"))
+                            shares_date = out.get("A_Shares_AsOf")
+
+                            if shares and shares_date:
+                                price_date = parse_date(shares_date)
+                                price = yahoo_close_on_date(t, price_date) if price_date else None
+                            else:
+                                price = None
+                                price_date = None
+
+                            out["P_Close_Price_USD"] = price
+                            out["P_Price_Date"] = price_date.isoformat() if price_date else None
+                            out["P_Market_Cap_USD"] = price * shares if price and shares else None
+                            out["P_MarketCap_Method"] = "Yahoo Close × EDGAR Shares"
+                        except Exception:
+                            # Never crash; just leave N/A
+                            pass
+                        
                     else:
                         out["Status"] = "OK (Tier A missing: companyfacts)"
                 except Exception:

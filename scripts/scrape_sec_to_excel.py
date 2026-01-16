@@ -1093,30 +1093,37 @@ def main() -> None:
                     if facts:
                         a = tier_a_metrics(facts)
                         out.update(a)
-                                                # Tier P: Market cap (price × shares outstanding)
+
+                        # Tier P: Market cap (price × shares outstanding)
                         try:
                             shares = safe_float(out.get("A_Shares_Outstanding"))
                             shares_date = out.get("A_Shares_AsOf")
 
+                            price = None
+                            price_date = None
+                            mcap = None
+
                             if shares and shares_date:
                                 price_date = parse_date(shares_date)
-                                price = yahoo_close_on_date(t, price_date) if price_date else None
-                            else:
-                                price = None
-                                price_date = None
+                                if price_date:
+                                    price = yahoo_close_on_date(t, price_date)
+                                    if price is not None:
+                                        mcap = price * shares
 
                             out["P_Close_Price_USD"] = price
                             out["P_Price_Date"] = price_date.isoformat() if price_date else None
-                            out["P_Market_Cap_USD"] = price * shares if price and shares else None
-                            out["P_MarketCap_Method"] = "Yahoo Close × EDGAR Shares"
+                            out["P_Market_Cap_USD"] = mcap
+                            out["P_MarketCap_Method"] = (
+                                "Yahoo Close × EDGAR Shares" if mcap is not None else None
+                            )
                         except Exception:
-                            # Never crash; just leave N/A
                             pass
-                        
+
                     else:
                         out["Status"] = "OK (Tier A missing: companyfacts)"
                 except Exception:
                     out["Status"] = "OK (Tier A partial)"
+
 
             # Tier B (Form 4 parsing) - best effort
             if ENABLE_TIER_B and tier_c:

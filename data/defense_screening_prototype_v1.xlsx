@@ -1,0 +1,24 @@
+python3 - <<'PY'
+from pathlib import Path
+from openpyxl import Workbook
+
+out = Path("data/defense_screening_prototype_v1.xlsx")
+out.parent.mkdir(parents=True, exist_ok=True)
+
+wb = Workbook()
+ws = wb.active
+ws.title = "Universe"
+
+ws.append([
+    "Ticker",
+    "Company Name",
+    "CIK",
+    "SIC",
+    "SIC Description",
+    "Aerospace & Defense",
+    "Data As-Of Date"
+])
+
+wb.save(out)
+print("Created:", out.resolve())
+PY

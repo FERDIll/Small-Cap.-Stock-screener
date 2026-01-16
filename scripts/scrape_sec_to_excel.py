@@ -305,30 +305,65 @@ from io import StringIO
 
 def yahoo_close_on_date(ticker: str, target_date: date) -> Optional[float]:
     """
-    Fetch daily close price from Yahoo Finance CSV for a given date.
-    No API key. Best-effort. Returns None if unavailable.
+    Yahoo chart endpoint (JSON) - no API key, more reliable than /download CSV.
+    Returns the close on target_date, or the nearest prior trading day close
+    within a small lookback window.
     """
-    # small buffer so weekends/holidays don’t break it
-    period1 = int(time.mktime((target_date - timedelta(days=5)).timetuple()))
-    period2 = int(time.mktime((target_date + timedelta(days=1)).timetuple()))
+    # Yahoo uses BRK-B not BRK.B etc.
+    yahoo_ticker = ticker.replace(".", "-")
+
+    # Look back a bit so weekends/holidays still work
+    start = target_date - timedelta(days=7)
+    end = target_date + timedelta(days=1)
+
+    period1 = int(time.mktime(start.timetuple()))
+    period2 = int(time.mktime(end.timetuple()))
 
     url = (
-        f"https://query1.finance.yahoo.com/v7/finance/download/{ticker}"
-        f"?period1={period1}&period2={period2}&interval=1d&events=history"
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_ticker}"
+        f"?period1={period1}&period2={period2}&interval=1d"
     )
 
+    headers = {
+        # Use a browser-like UA; some hosts block “bot-like” UAs.
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+    }
+
     try:
-        r = requests.get(url, headers=_http_headers(), timeout=20)
+        r = requests.get(url, headers=headers, timeout=20)
         sleep_rate_limit()
         r.raise_for_status()
-        reader = _csv.DictReader(StringIO(r.text))
-        for row in reader:
-            if row.get("Date") == target_date.isoformat():
-                return float(row.get("Close"))
+        j = r.json()
+
+        result = (j.get("chart") or {}).get("result") or []
+        if not result:
+            return None
+
+        res0 = result[0]
+        ts = res0.get("timestamp") or []
+        closes = (((res0.get("indicators") or {}).get("quote") or [{}])[0]).get("close") or []
+
+        # Build date -> close map
+        d2c: Dict[date, float] = {}
+        for tstamp, c in zip(ts, closes):
+            if c is None:
+                continue
+            d = datetime.fromtimestamp(int(tstamp), tz=timezone.utc).date()
+            d2c[d] = float(c)
+
+        # Exact match first
+        if target_date in d2c:
+            return d2c[target_date]
+
+        # Otherwise, nearest prior trading day within window
+        for k in sorted(d2c.keys(), reverse=True):
+            if k <= target_date:
+                return d2c[k]
+
+        return None
     except Exception:
         return None
-
-    return None
 
 def build_ticker_to_cik_map() -> Dict[str, Tuple[str, str]]:
     data = get_json_cached(SEC_COMPANY_TICKERS_URL, cache_key="company_tickers")

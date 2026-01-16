@@ -1,0 +1,7 @@
+mkdir -p data
+cat > data/universe.csv <<'CSV'
+ticker
+AVAV
+KTOS
+LMT
+CSV

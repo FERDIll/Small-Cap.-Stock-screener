@@ -74,6 +74,13 @@ USER_AGENT = "Ferdinand Niggemeier Small-Cap Stock Screener (Niggemeier.Ferdinan
 SECONDS_BETWEEN_REQUESTS = 0.2
 HTTP_TIMEOUT = 30
 
+# Gate 1 windows (tweak anytime)
+G1_MAX_AGE_10K_DAYS = 18 * 30   # ~18 months
+G1_MAX_AGE_10Q_DAYS = 9 * 30    # ~9 months
+G1_MAX_AGE_20F_DAYS = 24 * 30   # ~24 months
+
+ENABLE_GATE_1 = True
+
 # Switches (you can turn Tier B off if you want speed/reliability)
 ENABLE_TIER_A = True
 ENABLE_TIER_B = True   # Form 4 parsing (best-effort)
@@ -300,9 +307,6 @@ def get_text(url: str, cache_key: str) -> Optional[str]:
     except Exception:
         return None
 
-import csv as _csv
-from io import StringIO
-
 def yahoo_close_on_date(ticker: str, target_date: date) -> Optional[float]:
     """
     Yahoo chart endpoint (JSON) - no API key, more reliable than /download CSV.
@@ -398,6 +402,70 @@ def extract_sic(submissions: Dict[str, Any]) -> Tuple[Optional[int], Optional[st
     if sic_desc is not None:
         sic_desc = str(sic_desc).strip()
     return sic, sic_desc
+
+def _latest_date_for_form(submissions: Dict[str, Any], forms_wanted: set[str]) -> Optional[date]:
+    recent = (((submissions or {}).get("filings") or {}).get("recent") or {})
+    forms = recent.get("form") or []
+    filing_dates = recent.get("filingDate") or []
+
+    best: Optional[date] = None
+    for i, f in enumerate(forms):
+        if f not in forms_wanted:
+            continue
+        if i >= len(filing_dates):
+            continue
+        dd = parse_date(str(filing_dates[i]))
+        if dd and (best is None or dd > best):
+            best = dd
+    return best
+
+
+def gate1_reporting(submissions: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Gate 1: company must be a 'real reporter' with recent filings.
+
+    PASS if:
+      - 10-K within ~18 months, OR
+      - 10-Q within ~9 months, OR
+      - 20-F within ~24 months (foreign issuer)
+    FAIL if no filings / stale filings.
+
+    Returns (passed, reason, extra_fields_for_excel)
+    """
+    today = date.today()
+
+    latest_10k = _latest_date_for_form(submissions, {"10-K", "10-K/A"})
+    latest_10q = _latest_date_for_form(submissions, {"10-Q", "10-Q/A"})
+    latest_20f = _latest_date_for_form(submissions, {"20-F", "20-F/A"})
+
+    pass_10k = bool(latest_10k and (today - latest_10k).days <= G1_MAX_AGE_10K_DAYS)
+    pass_10q = bool(latest_10q and (today - latest_10q).days <= G1_MAX_AGE_10Q_DAYS)
+    pass_20f = bool(latest_20f and (today - latest_20f).days <= G1_MAX_AGE_20F_DAYS)
+
+    passed = pass_10k or pass_10q or pass_20f
+
+    extras = {
+        "G1_Pass_Reporting": "TRUE" if passed else "FALSE",
+        "G1_Latest_10K": latest_10k.isoformat() if latest_10k else None,
+        "G1_Latest_10Q": latest_10q.isoformat() if latest_10q else None,
+        "G1_Latest_20F": latest_20f.isoformat() if latest_20f else None,
+    }
+
+    if passed:
+        if pass_10k:
+            reason = "PASS: Recent 10-K"
+        elif pass_10q:
+            reason = "PASS: Recent 10-Q"
+        else:
+            reason = "PASS: Recent 20-F"
+    else:
+        if latest_10k or latest_10q or latest_20f:
+            reason = "FAIL: Filings exist but stale"
+        else:
+            reason = "FAIL: No 10-K/10-Q/20-F found"
+
+    extras["G1_Reason"] = reason
+    return passed, reason, extras
 
 
 # -----------------------------
@@ -902,6 +970,12 @@ BASE_HEADERS = [
     "Data As-Of Date",
     "Run Timestamp (UTC)",
     "Status",
+    "G1_Pass_Reporting",
+    "G1_Reason",
+    "G1_Latest_10K",
+    "G1_Latest_10Q",
+    "G1_Latest_20F",
+
 ]
 
 def ensure_output_workbook() -> None:
@@ -1079,12 +1153,22 @@ def main() -> None:
 
         # Default row if ticker not mapped
         if t not in t2c:
-            out_rows.append(build_base_row(
+            out = build_base_row(
                 ticker=t, cik10=None, name=None, sic=None, sic_desc=None, is_ad=None,
                 status="Ticker not found in SEC ticker map",
                 as_of=as_of,
-            ))
+            )
+            out.update({
+                "G1_Pass_Reporting": "FALSE",
+                "G1_Reason": "FAIL: Not in SEC ticker map",
+                "G1_Latest_10K": None,
+                "G1_Latest_10Q": None,
+                "G1_Latest_20F": None,
+            })
+            out_rows.append(out)
             continue
+
+
 
         cik10, name = t2c[t]
 
@@ -1097,8 +1181,16 @@ def main() -> None:
                     status="No submissions JSON",
                     as_of=as_of,
                 )
+                out.update({
+                    "G1_Pass_Reporting": "FALSE",
+                    "G1_Reason": "FAIL: No submissions JSON",
+                    "G1_Latest_10K": None,
+                    "G1_Latest_10Q": None,
+                    "G1_Latest_20F": None,
+                })
                 out_rows.append(out)
                 continue
+
 
             sic, sic_desc = extract_sic(submissions)
             is_ad = (sic in sic_allow) if sic is not None else False
@@ -1108,6 +1200,18 @@ def main() -> None:
                 status="OK",
                 as_of=as_of,
             )
+            # -----------------------------
+            # Gate 1: if not a real/active filer, stop immediately
+            # -----------------------------
+            if ENABLE_GATE_1:
+                passed, reason, g1_fields = gate1_reporting(submissions)
+                out.update(g1_fields)
+
+                if not passed:
+                    out["Status"] = "Excluded (Gate 1)"
+                    out_rows.append(out)
+                    continue
+
 
             # Tier C (filing-type signals)
             tier_c: Dict[str, Any] = {}

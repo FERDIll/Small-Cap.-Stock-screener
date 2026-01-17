@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """
-SEC small-cap screener scraper (tiered, failure-tolerant)
+SEC small-cap screener scraper (gated, tiered, failure-tolerant)
 
-Tiers:
-- Tier A: Structured XBRL/DEI facts (reliable) via SEC companyfacts JSON
-- Tier B: Insider behavior (Form 4) via XML parsing (optional; best-effort)
-- Tier C: Filing-type signals from submissions JSON (reliable enough)
-- Tier D: Text-mined disclosures (NOT implemented here; keep out of core)
+Pipeline per ticker (efficiency-first):
+1) Gate 1 (submissions only): Must be a recent filer (10-K / 10-Q / 20-F).
+   - If FAIL: write row + Gate 1 fields, stop.
+
+2) Gate 2 (companyfacts minimum): Must be "screenable" for this model.
+   - Requires: Revenue > 0, Shares outstanding > 0, and (Cash > 0 OR OCF exists).
+   - Only if those prelim checks pass do we compute Market Cap (Yahoo close × EDGAR shares)
+     and FAIL if Market Cap > $10B.
+   - If FAIL: write row + Gate 2 fields, stop.
+
+3) Tiers (only for Gate-2 passers):
+   - Tier C: filing-type signals (submissions)
+   - Tier A: full XBRL/DEI metrics (companyfacts) (reusing fetched facts)
+   - Tier B: insider Form 4 parsing (best-effort)
 
 Design goals:
 - Never crash the run because one company is missing data.
@@ -18,9 +27,9 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import time
 import zipfile
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -51,7 +60,7 @@ UNIVERSE_CANDIDATES = [
     DATA_DIR / "universe.csv",
     DATA_DIR / "Universe.xlsx",
     DATA_DIR / "universe.xlsx",
-    OUTPUT_XLSX,  # fallback
+    OUTPUT_XLSX,  # fallback: tickers may be in the Universe sheet of the output workbook
 ]
 
 UNIVERSE_SHEET = "Universe"
@@ -75,14 +84,18 @@ SECONDS_BETWEEN_REQUESTS = 0.2
 HTTP_TIMEOUT = 30
 
 # Gate 1 windows (tweak anytime)
-G1_MAX_AGE_10K_DAYS = 18 * 30   # ~18 months
-G1_MAX_AGE_10Q_DAYS = 9 * 30    # ~9 months
-G1_MAX_AGE_20F_DAYS = 24 * 30   # ~24 months
+G1_MAX_AGE_10K_DAYS = 18 * 30  # ~18 months
+G1_MAX_AGE_10Q_DAYS = 9 * 30   # ~9 months
+G1_MAX_AGE_20F_DAYS = 24 * 30  # ~24 months
 
 ENABLE_GATE_1 = True
+ENABLE_GATE_2 = True
 
-# Switches (you can turn Tier B off if you want speed/reliability)
-ENABLE_TIER_A = True
+# Gate 2 market cap threshold
+G2_MAX_MARKET_CAP_USD = 10_000_000_000
+
+# Switches: tiers (only run after gates pass)
+ENABLE_TIER_A_FULL = True
 ENABLE_TIER_B = True   # Form 4 parsing (best-effort)
 ENABLE_TIER_C = True
 
@@ -94,9 +107,9 @@ ENABLE_TIER_C = True
 def now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-import re
 
 TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,9}$")  # allows BRK.B, RDS-A, etc.
+
 
 def clean_ticker(raw: str) -> Optional[str]:
     t = (raw or "").strip().upper()
@@ -110,11 +123,13 @@ def clean_ticker(raw: str) -> Optional[str]:
 def sleep_rate_limit() -> None:
     time.sleep(SECONDS_BETWEEN_REQUESTS)
 
+
 def parse_date(s: str) -> Optional[date]:
     try:
         return datetime.strptime(s, "%Y-%m-%d").date()
     except Exception:
         return None
+
 
 def na(v: Any) -> Any:
     """Normalize missing values to 'N/A' (Excel-friendly)."""
@@ -124,6 +139,7 @@ def na(v: Any) -> Any:
         return "N/A"
     return v
 
+
 def safe_float(v: Any) -> Optional[float]:
     try:
         if v is None:
@@ -131,6 +147,7 @@ def safe_float(v: Any) -> Optional[float]:
         return float(v)
     except Exception:
         return None
+
 
 def normalize_header(s: str) -> str:
     return " ".join(str(s).strip().lower().split())
@@ -146,6 +163,7 @@ def ensure_sic_config() -> None:
             json.dumps({"sic_allowlist": DEFAULT_SIC_ALLOWLIST}, indent=2),
             encoding="utf-8",
         )
+
 
 def load_sic_allowlist() -> set[int]:
     ensure_sic_config()
@@ -167,6 +185,7 @@ def is_valid_xlsx(path: Path) -> bool:
     except Exception:
         return False
 
+
 def resolve_universe_input() -> Path:
     for p in UNIVERSE_CANDIDATES:
         if p.exists() and p.stat().st_size > 0:
@@ -177,14 +196,16 @@ def resolve_universe_input() -> Path:
         + " (or put tickers into the 'Universe' sheet of the output workbook)."
     )
 
+
 def dedupe_preserve_order(items: List[str]) -> List[str]:
     seen = set()
-    out = []
+    out: List[str] = []
     for x in items:
         if x not in seen:
             seen.add(x)
             out.append(x)
     return out
+
 
 def load_tickers_from_csv(path: Path) -> List[str]:
     tickers: List[str] = []
@@ -205,6 +226,7 @@ def load_tickers_from_csv(path: Path) -> List[str]:
                 if t and t != "TICKER":
                     tickers.append(t)
     return dedupe_preserve_order(tickers)
+
 
 def load_tickers_from_xlsx(path: Path, sheet_name: str, ticker_header: str) -> List[str]:
     if not is_valid_xlsx(path):
@@ -241,8 +263,8 @@ def load_tickers_from_xlsx(path: Path, sheet_name: str, ticker_header: str) -> L
         if t:
             tickers.append(t)
 
-
     return dedupe_preserve_order(tickers)
+
 
 def load_tickers_any(path: Path) -> List[str]:
     suffix = path.suffix.lower()
@@ -263,11 +285,9 @@ def _http_headers() -> Dict[str, str]:
         "Accept-Encoding": "gzip, deflate",
     }
 
+
 def get_json_cached(url: str, cache_key: str) -> Optional[Dict[str, Any]]:
-    """
-    Fetch JSON with a simple on-disk cache.
-    Returns None on failure (never raises).
-    """
+    """Fetch JSON with a simple on-disk cache. Returns None on failure."""
     cache_path = CACHE_DIR / f"{cache_key}.json"
     if cache_path.exists() and cache_path.stat().st_size > 10:
         try:
@@ -285,11 +305,9 @@ def get_json_cached(url: str, cache_key: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
+
 def get_text(url: str, cache_key: str) -> Optional[str]:
-    """
-    Fetch text (e.g., Form 4 XML) with cache.
-    Returns None on failure.
-    """
+    """Fetch text (e.g., Form 4 XML) with cache. Returns None on failure."""
     cache_path = CACHE_DIR / f"{cache_key}.txt"
     if cache_path.exists() and cache_path.stat().st_size > 10:
         try:
@@ -307,16 +325,13 @@ def get_text(url: str, cache_key: str) -> Optional[str]:
     except Exception:
         return None
 
+
 def yahoo_close_on_date(ticker: str, target_date: date) -> Optional[float]:
     """
-    Yahoo chart endpoint (JSON) - no API key, more reliable than /download CSV.
-    Returns the close on target_date, or the nearest prior trading day close
-    within a small lookback window.
+    Yahoo chart endpoint (JSON) - no API key.
+    Returns the close on target_date, or nearest prior trading day within lookback.
     """
-    # Yahoo uses BRK-B not BRK.B etc.
     yahoo_ticker = ticker.replace(".", "-")
-
-    # Look back a bit so weekends/holidays still work
     start = target_date - timedelta(days=7)
     end = target_date + timedelta(days=1)
 
@@ -329,7 +344,6 @@ def yahoo_close_on_date(ticker: str, target_date: date) -> Optional[float]:
     )
 
     headers = {
-        # Use a browser-like UA; some hosts block “bot-like” UAs.
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json,text/plain,*/*",
     }
@@ -348,7 +362,6 @@ def yahoo_close_on_date(ticker: str, target_date: date) -> Optional[float]:
         ts = res0.get("timestamp") or []
         closes = (((res0.get("indicators") or {}).get("quote") or [{}])[0]).get("close") or []
 
-        # Build date -> close map
         d2c: Dict[date, float] = {}
         for tstamp, c in zip(ts, closes):
             if c is None:
@@ -356,11 +369,9 @@ def yahoo_close_on_date(ticker: str, target_date: date) -> Optional[float]:
             d = datetime.fromtimestamp(int(tstamp), tz=timezone.utc).date()
             d2c[d] = float(c)
 
-        # Exact match first
         if target_date in d2c:
             return d2c[target_date]
 
-        # Otherwise, nearest prior trading day within window
         for k in sorted(d2c.keys(), reverse=True):
             if k <= target_date:
                 return d2c[k]
@@ -368,6 +379,7 @@ def yahoo_close_on_date(ticker: str, target_date: date) -> Optional[float]:
         return None
     except Exception:
         return None
+
 
 def build_ticker_to_cik_map() -> Dict[str, Tuple[str, str]]:
     data = get_json_cached(SEC_COMPANY_TICKERS_URL, cache_key="company_tickers")
@@ -382,13 +394,16 @@ def build_ticker_to_cik_map() -> Dict[str, Tuple[str, str]]:
             mapping[ticker] = (cik_str.zfill(10), title)
     return mapping
 
+
 def fetch_company_submissions(cik10: str) -> Optional[Dict[str, Any]]:
     url = SEC_SUBMISSIONS_URL_TMPL.format(cik10=cik10)
     return get_json_cached(url, cache_key=f"submissions_{cik10}")
 
+
 def fetch_company_facts(cik10: str) -> Optional[Dict[str, Any]]:
     url = SEC_COMPANYFACTS_URL_TMPL.format(cik10=cik10)
     return get_json_cached(url, cache_key=f"companyfacts_{cik10}")
+
 
 def extract_sic(submissions: Dict[str, Any]) -> Tuple[Optional[int], Optional[str]]:
     sic_raw = submissions.get("sic")
@@ -402,6 +417,11 @@ def extract_sic(submissions: Dict[str, Any]) -> Tuple[Optional[int], Optional[st
     if sic_desc is not None:
         sic_desc = str(sic_desc).strip()
     return sic, sic_desc
+
+
+# -----------------------------
+# Gate 1: reporting recency (submissions-only)
+# -----------------------------
 
 def _latest_date_for_form(submissions: Dict[str, Any], forms_wanted: set[str]) -> Optional[date]:
     recent = (((submissions or {}).get("filings") or {}).get("recent") or {})
@@ -421,17 +441,6 @@ def _latest_date_for_form(submissions: Dict[str, Any], forms_wanted: set[str]) -
 
 
 def gate1_reporting(submissions: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
-    """
-    Gate 1: company must be a 'real reporter' with recent filings.
-
-    PASS if:
-      - 10-K within ~18 months, OR
-      - 10-Q within ~9 months, OR
-      - 20-F within ~24 months (foreign issuer)
-    FAIL if no filings / stale filings.
-
-    Returns (passed, reason, extra_fields_for_excel)
-    """
     today = date.today()
 
     latest_10k = _latest_date_for_form(submissions, {"10-K", "10-K/A"})
@@ -469,34 +478,29 @@ def gate1_reporting(submissions: Dict[str, Any]) -> Tuple[bool, str, Dict[str, A
 
 
 # -----------------------------
-# Tier A: XBRL/DEI metrics (best effort)
+# Tier A helpers (XBRL / companyfacts)
 # -----------------------------
 
 GAAP_TAGS = {
-    # Revenue
     "revenue": ["Revenues", "SalesRevenueNet"],
-    # Operating income
     "op_income": ["OperatingIncomeLoss"],
-    # R&D
     "rnd": ["ResearchAndDevelopmentExpense"],
-    # SG&A
     "sga": ["SellingGeneralAndAdministrativeExpense"],
-    # CFO
     "ocf": ["NetCashProvidedByUsedInOperatingActivities"],
-    # Capex
     "capex": ["PaymentsToAcquirePropertyPlantAndEquipment"],
-    # Cash
-    "cash": ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],
+    "cash": [
+        "CashAndCashEquivalentsAtCarryingValue",
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+    ],
     "cash_st_inv": ["CashAndCashEquivalentsAndShortTermInvestments"],
-    # Debt
     "debt_lt": ["LongTermDebtNoncurrent", "LongTermDebt"],
     "debt_st": ["DebtCurrent", "LongTermDebtCurrent"],
-    # Balance sheet
-    "assets": ["Assets"],
     "current_assets": ["AssetsCurrent"],
     "current_liab": ["LiabilitiesCurrent"],
-    "equity": ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
-    # SBC
+    "equity": [
+        "StockholdersEquity",
+        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    ],
     "sbc": ["ShareBasedCompensation"],
 }
 
@@ -504,19 +508,21 @@ DEI_TAGS = {
     "shares_out": ["EntityCommonStockSharesOutstanding"],
 }
 
+
 def _facts_units(facts: Dict[str, Any], namespace: str, tag: str) -> Optional[Dict[str, Any]]:
     try:
         return facts["facts"][namespace][tag]["units"]
     except Exception:
         return None
 
+
 def _iter_fact_points(units: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
-    # units keys might be "USD", "shares", etc. pick all and iterate
     for _, arr in units.items():
         if isinstance(arr, list):
             for p in arr:
                 if isinstance(p, dict):
                     yield p
+
 
 def _pick_period_points(
     facts: Dict[str, Any],
@@ -539,22 +545,17 @@ def _pick_period_points(
             if not p.get("end") or p.get("val") is None:
                 continue
             points.append(p)
-    # sort by end date
     points.sort(key=lambda x: x.get("end", ""))
     return points
 
+
 def _latest_instant(points: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    # For instant facts like shares outstanding, balance sheet: take latest by end
-    if not points:
-        return None
-    return points[-1]
+    return points[-1] if points else None
+
 
 def _latest_four_quarters(points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    # Prefer quarterly points (fp Q1/Q2/Q3/Q4 if present; SEC uses Q1/Q2/Q3 and FY)
-    # We'll just take last 4 by end date for points already filtered to quarterly-style
-    if len(points) <= 4:
-        return points
-    return points[-4:]
+    return points[-4:] if len(points) > 4 else points
+
 
 def _sum_vals(points: List[Dict[str, Any]]) -> Optional[float]:
     vals = [safe_float(p.get("val")) for p in points]
@@ -563,6 +564,7 @@ def _sum_vals(points: List[Dict[str, Any]]) -> Optional[float]:
         return None
     return float(sum(vals))
 
+
 def _yoy_growth(latest: float, prev: float) -> Optional[float]:
     if latest is None or prev is None:
         return None
@@ -570,54 +572,42 @@ def _yoy_growth(latest: float, prev: float) -> Optional[float]:
         return None
     return (latest / prev) - 1.0
 
-def tier_a_metrics(companyfacts: Dict[str, Any]) -> Dict[str, Any]:
+
+# -----------------------------
+# Gate 2: minimum screenability (companyfacts-min)
+# -----------------------------
+
+def tier_a_min_metrics(companyfacts: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Returns a dict of Tier A metrics. Any missing becomes 'N/A' later.
+    Minimum subset needed for Gate 2 (fastest useful cut):
+      - A_TTM_Revenue_USD (+ end date)
+      - A_TTM_OCF_USD
+      - A_Cash_USD (+ end date)
+      - A_Shares_Outstanding (+ as-of)
     """
     out: Dict[str, Any] = {}
 
     forms = {"10-Q", "10-K"}
-    # Income statement flow tags: prefer quarterly points where possible
-    # We include fp in {"Q1","Q2","Q3","FY"} and then heuristically compute.
     fps_flow = {"Q1", "Q2", "Q3", "FY"}
-
-    # Revenue points
-    rev_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["revenue"], forms=forms, fps=fps_flow)
-    opinc_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["op_income"], forms=forms, fps=fps_flow)
-    rnd_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["rnd"], forms=forms, fps=fps_flow)
-    sga_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["sga"], forms=forms, fps=fps_flow)
-    ocf_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["ocf"], forms=forms, fps=fps_flow)
-    capex_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["capex"], forms=forms, fps=fps_flow)
-    sbc_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["sbc"], forms=forms, fps=fps_flow)
-
-    # Balance sheet instants
     fps_inst = {"Q1", "Q2", "Q3", "FY"}
+
+    rev_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["revenue"], forms=forms, fps=fps_flow)
+    ocf_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["ocf"], forms=forms, fps=fps_flow)
+
     cash_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["cash_st_inv"], forms=forms, fps=fps_inst)
     if not cash_points:
         cash_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["cash"], forms=forms, fps=fps_inst)
 
-    debt_lt_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["debt_lt"], forms=forms, fps=fps_inst)
-    debt_st_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["debt_st"], forms=forms, fps=fps_inst)
-
-    curr_assets_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["current_assets"], forms=forms, fps=fps_inst)
-    curr_liab_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["current_liab"], forms=forms, fps=fps_inst)
-    equity_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["equity"], forms=forms, fps=fps_inst)
-
-    # Shares outstanding (DEI)
     shares_points = _pick_period_points(companyfacts, "dei", DEI_TAGS["shares_out"], forms=forms, fps=fps_inst)
 
-    # --- Compute TTM revenue (prefer last 4 quarters if we can approximate) ---
-    # Best-effort: If we have >=4 points, take last 4 values and sum.
-    # If not, fall back to latest FY revenue.
+    # TTM-ish revenue: prefer last 4 points, else latest FY
     ttm_rev = None
     ttm_rev_end = None
-
     if len(rev_points) >= 4:
         last4 = _latest_four_quarters(rev_points)
         ttm_rev = _sum_vals(last4)
         ttm_rev_end = last4[-1].get("end")
     else:
-        # fallback to latest FY
         fy = [p for p in rev_points if p.get("fp") == "FY"]
         if fy:
             last = fy[-1]
@@ -627,21 +617,184 @@ def tier_a_metrics(companyfacts: Dict[str, Any]) -> Dict[str, Any]:
     out["A_TTM_Revenue_USD"] = ttm_rev
     out["A_TTM_Revenue_End"] = ttm_rev_end
 
-    # YoY growth (quarterly-style if possible; else FY YoY)
+    # TTM-ish OCF: prefer last 4, else latest FY
+    ttm_ocf = None
+    if len(ocf_points) >= 4:
+        ttm_ocf = _sum_vals(_latest_four_quarters(ocf_points))
+    else:
+        fy = [p for p in ocf_points if p.get("fp") == "FY"]
+        if fy:
+            ttm_ocf = safe_float(fy[-1].get("val"))
+    out["A_TTM_OCF_USD"] = ttm_ocf
+
+    # Cash (latest instant)
+    cash_latest = None
+    cash_end = None
+    li = _latest_instant(cash_points)
+    if li:
+        cash_latest = safe_float(li.get("val"))
+        cash_end = li.get("end")
+    out["A_Cash_USD"] = cash_latest
+    out["A_Cash_End"] = cash_end
+
+    # Shares outstanding (latest)
+    sh = _latest_instant(shares_points)
+    out["A_Shares_Outstanding"] = safe_float(sh.get("val")) if sh else None
+    out["A_Shares_AsOf"] = sh.get("end") if sh else None
+
+    return out
+
+
+def compute_market_cap_from_out(out: Dict[str, Any], ticker: str) -> Dict[str, Any]:
+    """
+    Compute market cap (Yahoo close × EDGAR shares) using existing out fields.
+    Returns P_* fields. Never raises.
+    """
+    try:
+        shares = safe_float(out.get("A_Shares_Outstanding"))
+        shares_date = out.get("A_Shares_AsOf")
+
+        price = None
+        price_date = None
+        mcap = None
+
+        if shares and shares_date:
+            price_date = parse_date(str(shares_date))
+            if price_date:
+                price = yahoo_close_on_date(ticker, price_date)
+                if price is not None:
+                    mcap = price * shares
+
+        return {
+            "P_Close_Price_USD": price,
+            "P_Price_Date": price_date.isoformat() if price_date else None,
+            "P_Market_Cap_USD": mcap,
+            "P_MarketCap_Method": "Yahoo Close × EDGAR Shares" if mcap is not None else None,
+        }
+    except Exception:
+        return {
+            "P_Close_Price_USD": None,
+            "P_Price_Date": None,
+            "P_Market_Cap_USD": None,
+            "P_MarketCap_Method": None,
+        }
+
+
+def gate2_basics(out: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Gate 2: screenability for this model.
+
+    Requirements:
+      - Revenue exists and > 0 (A_TTM_Revenue_USD)
+      - Shares outstanding exists and > 0 (A_Shares_Outstanding)
+      - Cash > 0 OR operating cash flow exists (A_Cash_USD OR A_TTM_OCF_USD)
+      - If market cap exists and > $10B => FAIL (market cap is computed only after prelim pass)
+    """
+    rev = safe_float(out.get("A_TTM_Revenue_USD"))
+    shares = safe_float(out.get("A_Shares_Outstanding"))
+    cash = safe_float(out.get("A_Cash_USD"))
+    ocf = safe_float(out.get("A_TTM_OCF_USD"))
+    mcap = safe_float(out.get("P_Market_Cap_USD"))
+
+    revenue_ok = (rev is not None and rev > 0)
+    shares_ok = (shares is not None and shares > 0)
+    cash_or_ocf_ok = ((cash is not None and cash > 0) or (ocf is not None))
+
+    # Market cap threshold only applies if we managed to compute it
+    mcap_over = None
+    if mcap is not None:
+        mcap_over = (mcap > G2_MAX_MARKET_CAP_USD)
+
+    passed = revenue_ok and shares_ok and cash_or_ocf_ok and (mcap_over is not True)
+
+    if not revenue_ok:
+        reason = "FAIL: Revenue missing or <= 0"
+    elif not shares_ok:
+        reason = "FAIL: Shares outstanding missing"
+    elif not cash_or_ocf_ok:
+        reason = "FAIL: Neither cash>0 nor operating cash flow available"
+    elif mcap_over is True:
+        reason = f"FAIL: Market cap > ${G2_MAX_MARKET_CAP_USD:,.0f}"
+    else:
+        reason = "PASS: Screenable fundamentals present"
+
+    extras = {
+        "G2_Pass_Basics": "TRUE" if passed else "FALSE",
+        "G2_Reason": reason,
+        "G2_Revenue_Positive": "TRUE" if revenue_ok else "FALSE",
+        "G2_Shares_Exists": "TRUE" if shares_ok else "FALSE",
+        "G2_CashOrOCF_Exists": "TRUE" if cash_or_ocf_ok else "FALSE",
+        "G2_MarketCap_Over_10B": (
+            "TRUE" if mcap_over is True else "FALSE" if mcap_over is False else None
+        ),
+        "G2_MarketCap_USD": mcap,
+    }
+    return passed, reason, extras
+
+
+# -----------------------------
+# Tier A: FULL metrics (runs only for Gate-2 passers; reuses facts)
+# -----------------------------
+
+def tier_a_full_metrics(companyfacts: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Full Tier A metrics (same spirit as your original tier_a_metrics), but WITHOUT market cap.
+    Market cap is handled by Gate 2 (recycled).
+    """
+    out: Dict[str, Any] = {}
+
+    forms = {"10-Q", "10-K"}
+    fps_flow = {"Q1", "Q2", "Q3", "FY"}
+    fps_inst = {"Q1", "Q2", "Q3", "FY"}
+
+    rev_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["revenue"], forms=forms, fps=fps_flow)
+    opinc_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["op_income"], forms=forms, fps=fps_flow)
+    rnd_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["rnd"], forms=forms, fps=fps_flow)
+    sga_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["sga"], forms=forms, fps=fps_flow)
+    ocf_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["ocf"], forms=forms, fps=fps_flow)
+    capex_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["capex"], forms=forms, fps=fps_flow)
+    sbc_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["sbc"], forms=forms, fps=fps_flow)
+
+    cash_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["cash_st_inv"], forms=forms, fps=fps_inst)
+    if not cash_points:
+        cash_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["cash"], forms=forms, fps=fps_inst)
+
+    debt_lt_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["debt_lt"], forms=forms, fps=fps_inst)
+    debt_st_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["debt_st"], forms=forms, fps=fps_inst)
+    curr_assets_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["current_assets"], forms=forms, fps=fps_inst)
+    curr_liab_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["current_liab"], forms=forms, fps=fps_inst)
+    equity_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["equity"], forms=forms, fps=fps_inst)
+
+    shares_points = _pick_period_points(companyfacts, "dei", DEI_TAGS["shares_out"], forms=forms, fps=fps_inst)
+
+    # TTM revenue and YoY growth (best-effort)
+    ttm_rev = None
+    ttm_rev_end = None
+    if len(rev_points) >= 4:
+        last4 = _latest_four_quarters(rev_points)
+        ttm_rev = _sum_vals(last4)
+        ttm_rev_end = last4[-1].get("end")
+    else:
+        fy = [p for p in rev_points if p.get("fp") == "FY"]
+        if fy:
+            last = fy[-1]
+            ttm_rev = safe_float(last.get("val"))
+            ttm_rev_end = last.get("end")
+    out["A_TTM_Revenue_USD"] = ttm_rev
+    out["A_TTM_Revenue_End"] = ttm_rev_end
+
     yoy = None
     if len(rev_points) >= 8:
-        latest4 = _latest_four_quarters(rev_points)     # not used directly
         latest = rev_points[-1]
-        prev_year = rev_points[-5]  # roughly same quarter prior year if series is quarterly-ish
+        prev_year = rev_points[-5]
         yoy = _yoy_growth(safe_float(latest.get("val")), safe_float(prev_year.get("val")))
     else:
         fy = [p for p in rev_points if p.get("fp") == "FY"]
         if len(fy) >= 2:
             yoy = _yoy_growth(safe_float(fy[-1].get("val")), safe_float(fy[-2].get("val")))
-
     out["A_Revenue_YoY_Growth"] = yoy
 
-    # Operating margin (best-effort: latest period op income / latest period revenue)
+    # Operating margin (latest period)
     op_margin = None
     if rev_points and opinc_points:
         rev_last = safe_float(rev_points[-1].get("val"))
@@ -650,7 +803,7 @@ def tier_a_metrics(companyfacts: Dict[str, Any]) -> Dict[str, Any]:
             op_margin = op_last / rev_last
     out["A_Operating_Margin"] = op_margin
 
-    # R&D intensity and SG&A intensity (latest period)
+    # Intensities (latest)
     rnd_int = None
     if rev_points and rnd_points:
         rev_last = safe_float(rev_points[-1].get("val"))
@@ -667,7 +820,7 @@ def tier_a_metrics(companyfacts: Dict[str, Any]) -> Dict[str, Any]:
             sga_int = sga_last / rev_last
     out["A_SGandA_Intensity"] = sga_int
 
-    # Cash burn / runway: use latest cash and last-4-quarter OCF/FCF
+    # Cash (latest)
     cash_latest = None
     cash_end = None
     li = _latest_instant(cash_points)
@@ -734,15 +887,14 @@ def tier_a_metrics(companyfacts: Dict[str, Any]) -> Dict[str, Any]:
     out["A_Shares_Outstanding"] = safe_float(sh.get("val")) if sh else None
     out["A_Shares_AsOf"] = sh.get("end") if sh else None
 
-    # SBC (latest period)
-    sbc_latest = safe_float(sbc_points[-1].get("val")) if sbc_points else None
-    out["A_SBC_USD_Latest"] = sbc_latest
+    # SBC latest
+    out["A_SBC_USD_Latest"] = safe_float(sbc_points[-1].get("val")) if sbc_points else None
 
     return out
 
 
 # -----------------------------
-# Tier C: Filing-type signals from submissions
+# Tier C: filing-type signals from submissions
 # -----------------------------
 
 def tier_c_metrics(submissions: Dict[str, Any]) -> Dict[str, Any]:
@@ -753,7 +905,6 @@ def tier_c_metrics(submissions: Dict[str, Any]) -> Dict[str, Any]:
     accession = recent.get("accessionNumber") or []
     primary_docs = recent.get("primaryDocument") or []
 
-    # Basic counts in windows
     today = date.today()
     d90 = today - timedelta(days=90)
     d365 = today - timedelta(days=365)
@@ -774,17 +925,11 @@ def tier_c_metrics(submissions: Dict[str, Any]) -> Dict[str, Any]:
     out["C_10Q_Count_365d"] = count_form({"10-Q"}, d365)
     out["C_10K_Count_365d"] = count_form({"10-K"}, d365)
     out["C_8K_Count_365d"] = count_form({"8-K"}, d365)
-
     out["C_S1_or_S3_Count_365d"] = count_form({"S-1", "S-1/A", "S-3", "S-3/A"}, d365)
-    out["C_424B_Count_365d"] = count_form({"424B1","424B2","424B3","424B4","424B5","424B7"}, d365)
+    out["C_424B_Count_365d"] = count_form({"424B1", "424B2", "424B3", "424B4", "424B5", "424B7"}, d365)
+    out["C_13D_13G_Count_365d"] = count_form({"SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A"}, d365)
+    out["C_Form4_Count_90d"] = count_form({"4", "4/A"}, d90)
 
-    out["C_13D_13G_Count_365d"] = count_form(
-        {"SC 13D","SC 13D/A","SC 13G","SC 13G/A"}, d365
-    )
-
-    out["C_Form4_Count_90d"] = count_form({"4","4/A"}, d90)
-
-    # Latest core filing dates
     def latest_date_for(form_set: set[str]) -> Optional[str]:
         best: Optional[date] = None
         for i, f in enumerate(forms):
@@ -797,14 +942,12 @@ def tier_c_metrics(submissions: Dict[str, Any]) -> Dict[str, Any]:
 
     out["C_Latest_10Q_Date"] = latest_date_for({"10-Q"})
     out["C_Latest_10K_Date"] = latest_date_for({"10-K"})
-    out["C_Latest_Shelf_Date"] = latest_date_for({"S-3","S-3/A","S-1","S-1/A"})
-    out["C_Latest_Form4_Date"] = latest_date_for({"4","4/A"})
+    out["C_Latest_Shelf_Date"] = latest_date_for({"S-3", "S-3/A", "S-1", "S-1/A"})
+    out["C_Latest_Form4_Date"] = latest_date_for({"4", "4/A"})
 
-    # Keep references needed for Tier B parsing (best effort)
-    # We'll expose the recent list length to help debugging
     out["C_Recent_Filings_Listed"] = len(forms)
 
-    # Store arrays for Tier B (not written to Excel)
+    # Internal arrays for Tier B
     out["_recent_forms"] = forms
     out["_recent_filing_dates"] = filing_dates
     out["_recent_accession"] = accession
@@ -818,31 +961,21 @@ def tier_c_metrics(submissions: Dict[str, Any]) -> Dict[str, Any]:
 # -----------------------------
 
 def _parse_form4_net_open_market(xml_text: str) -> Tuple[Optional[float], Optional[int]]:
-    """
-    Best-effort Form 4 XML parsing:
-    - Sum open market purchases (transactionCode P) as +shares
-    - Sum sales (transactionCode S) as -shares
-    Returns (net_shares, tx_count)
-    """
     try:
         root = ET.fromstring(xml_text)
     except Exception:
         return None, None
 
-    # Different Form 4 XML variants exist; we will search broadly.
     net = 0.0
     tx = 0
 
     def findall_local(tag: str) -> List[ET.Element]:
-        # match by localname ignoring namespaces
-        out = []
+        out: List[ET.Element] = []
         for el in root.iter():
             if el.tag.split("}")[-1] == tag:
                 out.append(el)
         return out
 
-    # Transactions can be in nonDerivativeTransaction / derivativeTransaction
-    # We'll focus on non-derivative common stock transactions first.
     for nd in findall_local("nonDerivativeTransaction"):
         code_el = None
         shares_el = None
@@ -851,20 +984,17 @@ def _parse_form4_net_open_market(xml_text: str) -> Tuple[Optional[float], Option
             if ln == "transactionCode":
                 code_el = el
             if ln == "transactionShares":
-                # often has inner <value>
                 shares_el = el
         if code_el is None or shares_el is None:
             continue
 
         code = "".join((code_el.text or "").split()).upper()
-        # Extract shares numeric (look for nested <value>)
         shares_val = None
         val_nodes = [e for e in shares_el.iter() if e.tag.split("}")[-1] == "value"]
         if val_nodes and val_nodes[-1].text:
             shares_val = safe_float(val_nodes[-1].text.strip())
         elif shares_el.text:
             shares_val = safe_float(shares_el.text.strip())
-
         if shares_val is None:
             continue
 
@@ -879,6 +1009,7 @@ def _parse_form4_net_open_market(xml_text: str) -> Tuple[Optional[float], Option
         return None, None
     return net, tx
 
+
 def tier_b_metrics_from_recent_forms(
     cik10: str,
     tier_c: Dict[str, Any],
@@ -886,12 +1017,6 @@ def tier_b_metrics_from_recent_forms(
     lookback_days: int = 180,
     max_forms_to_check: int = 10,
 ) -> Dict[str, Any]:
-    """
-    Uses submissions recent filings (Tier C) to locate recent Form 4 filings,
-    downloads their primaryDocument (often XML), and computes net shares best-effort.
-
-    Returns N/A if not available.
-    """
     out: Dict[str, Any] = {}
 
     forms: List[str] = tier_c.get("_recent_forms") or []
@@ -905,15 +1030,16 @@ def tier_b_metrics_from_recent_forms(
     net_total = 0.0
     tx_total = 0
     checked = 0
-    last_form4 = None
+    last_form4: Optional[date] = None
 
-    cik_nolead = str(int(cik10))  # archives path uses no leading zeros
+    cik_nolead = str(int(cik10))
 
     for i, f in enumerate(forms):
         if checked >= max_forms_to_check:
             break
         if f not in {"4", "4/A"}:
             continue
+
         dd = parse_date(str(filing_dates[i])) if i < len(filing_dates) else None
         if not dd or dd < start:
             continue
@@ -923,7 +1049,6 @@ def tier_b_metrics_from_recent_forms(
         if not acc or not doc:
             continue
 
-        # Build archive URL
         acc_nodash = acc.replace("-", "")
         url = SEC_ARCHIVES_PRIMARYDOC_TMPL.format(
             cik_nolead=cik_nolead,
@@ -970,13 +1095,30 @@ BASE_HEADERS = [
     "Data As-Of Date",
     "Run Timestamp (UTC)",
     "Status",
+
+    # Gate 1
     "G1_Pass_Reporting",
     "G1_Reason",
     "G1_Latest_10K",
     "G1_Latest_10Q",
     "G1_Latest_20F",
 
+    # Gate 2
+    "G2_Pass_Basics",
+    "G2_Reason",
+    "G2_Revenue_Positive",
+    "G2_Shares_Exists",
+    "G2_CashOrOCF_Exists",
+    "G2_MarketCap_Over_10B",
+    "G2_MarketCap_USD",
+
+    # Market cap fields (computed in Gate 2 path)
+    "P_Close_Price_USD",
+    "P_Price_Date",
+    "P_Market_Cap_USD",
+    "P_MarketCap_Method",
 ]
+
 
 def ensure_output_workbook() -> None:
     if is_valid_xlsx(OUTPUT_XLSX):
@@ -993,6 +1135,7 @@ def ensure_output_workbook() -> None:
     ws.append(BASE_HEADERS)
     wb.save(OUTPUT_XLSX)
 
+
 def find_header_row(ws: Worksheet, max_rows: int = 20) -> Tuple[int, Dict[str, int]]:
     best_row = None
     best_map: Dict[str, int] = {}
@@ -1003,7 +1146,6 @@ def find_header_row(ws: Worksheet, max_rows: int = 20) -> Tuple[int, Dict[str, i
             v = ws.cell(row=r, column=c).value
             if isinstance(v, str) and v.strip():
                 row_map[normalize_header(v)] = c
-        # detect a likely header row
         if "ticker" in row_map and ("cik" in row_map or "company name" in row_map):
             best_row = r
             best_map = row_map
@@ -1019,11 +1161,8 @@ def find_header_row(ws: Worksheet, max_rows: int = 20) -> Tuple[int, Dict[str, i
 
     return best_row, best_map
 
+
 def ensure_columns(ws: Worksheet, header_row: int, header_map: Dict[str, int], columns: List[str]) -> Dict[str, int]:
-    """
-    Ensure all columns exist. Add missing at the end.
-    Returns updated header_map (normalized -> col index).
-    """
     max_col = ws.max_column
     for col_name in columns:
         key = normalize_header(col_name)
@@ -1034,10 +1173,8 @@ def ensure_columns(ws: Worksheet, header_row: int, header_map: Dict[str, int], c
         header_map[key] = max_col
     return header_map
 
+
 def build_ticker_row_index(ws: Worksheet, header_row: int, ticker_col: int) -> Dict[str, int]:
-    """
-    Map ticker -> row number for existing rows.
-    """
     idx: Dict[str, int] = {}
     for r in range(header_row + 1, ws.max_row + 1):
         v = ws.cell(row=r, column=ticker_col).value
@@ -1048,6 +1185,7 @@ def build_ticker_row_index(ws: Worksheet, header_row: int, ticker_col: int) -> D
             idx[t] = r
     return idx
 
+
 def write_company_dicts_to_excel(xlsx_path: Path, rows: List[Dict[str, Any]]) -> None:
     wb = load_workbook(xlsx_path)
     if UNIVERSE_SHEET not in wb.sheetnames:
@@ -1057,12 +1195,11 @@ def write_company_dicts_to_excel(xlsx_path: Path, rows: List[Dict[str, Any]]) ->
 
     header_row, header_map = find_header_row(ws)
 
-    # Determine all columns to ensure (base + dynamic keys)
     dynamic_cols: List[str] = []
     for r in rows:
         for k in r.keys():
             if k.startswith("_"):
-                continue  # internal
+                continue
             if k not in dynamic_cols and k not in BASE_HEADERS:
                 dynamic_cols.append(k)
 
@@ -1071,13 +1208,11 @@ def write_company_dicts_to_excel(xlsx_path: Path, rows: List[Dict[str, Any]]) ->
 
     ticker_col = header_map.get("ticker")
     if not ticker_col:
-        # If no ticker column, create it explicitly
         header_map = ensure_columns(ws, header_row, header_map, ["Ticker"])
         ticker_col = header_map["ticker"]
 
     existing = build_ticker_row_index(ws, header_row, ticker_col)
 
-    # Find next append row
     append_row = ws.max_row + 1
     while ws.cell(row=append_row, column=ticker_col).value not in (None, ""):
         append_row += 1
@@ -1086,6 +1221,7 @@ def write_company_dicts_to_excel(xlsx_path: Path, rows: List[Dict[str, Any]]) ->
         ticker = str(rd.get("Ticker") or rd.get("ticker") or "").strip().upper()
         if not ticker:
             continue
+
         row_num = existing.get(ticker)
         if row_num is None:
             row_num = append_row
@@ -1097,7 +1233,6 @@ def write_company_dicts_to_excel(xlsx_path: Path, rows: List[Dict[str, Any]]) ->
                 continue
             col = header_map.get(normalize_header(k))
             if not col:
-                # late-add column
                 header_map = ensure_columns(ws, header_row, header_map, [k])
                 col = header_map[normalize_header(k)]
             ws.cell(row=row_num, column=col).value = na(v)
@@ -1106,7 +1241,7 @@ def write_company_dicts_to_excel(xlsx_path: Path, rows: List[Dict[str, Any]]) ->
 
 
 # -----------------------------
-# Main orchestration (tiered, safe)
+# Main orchestration (gates first, tiers after)
 # -----------------------------
 
 def build_base_row(
@@ -1132,6 +1267,7 @@ def build_base_row(
         "Status": status,
     }
 
+
 def main() -> None:
     ensure_output_workbook()
     sic_allow = load_sic_allowlist()
@@ -1151,10 +1287,15 @@ def main() -> None:
         if not t:
             continue
 
-        # Default row if ticker not mapped
+        # --- Ticker not mapped: immediate stop (Gate 1 false, Gate 2 false) ---
         if t not in t2c:
             out = build_base_row(
-                ticker=t, cik10=None, name=None, sic=None, sic_desc=None, is_ad=None,
+                ticker=t,
+                cik10=None,
+                name=None,
+                sic=None,
+                sic_desc=None,
+                is_ad=None,
                 status="Ticker not found in SEC ticker map",
                 as_of=as_of,
             )
@@ -1164,20 +1305,36 @@ def main() -> None:
                 "G1_Latest_10K": None,
                 "G1_Latest_10Q": None,
                 "G1_Latest_20F": None,
+
+                "G2_Pass_Basics": "FALSE",
+                "G2_Reason": "FAIL: Gate 1 failed (no CIK)",
+                "G2_Revenue_Positive": None,
+                "G2_Shares_Exists": None,
+                "G2_CashOrOCF_Exists": None,
+                "G2_MarketCap_Over_10B": None,
+                "G2_MarketCap_USD": None,
+
+                "P_Close_Price_USD": None,
+                "P_Price_Date": None,
+                "P_Market_Cap_USD": None,
+                "P_MarketCap_Method": None,
             })
             out_rows.append(out)
             continue
 
-
-
         cik10, name = t2c[t]
 
-        # Wrap each company so failures don’t kill the run
         try:
+            # --- Gate 1 inputs: submissions JSON ---
             submissions = fetch_company_submissions(cik10)
             if not submissions:
                 out = build_base_row(
-                    ticker=t, cik10=cik10, name=name, sic=None, sic_desc=None, is_ad=None,
+                    ticker=t,
+                    cik10=cik10,
+                    name=name,
+                    sic=None,
+                    sic_desc=None,
+                    is_ad=None,
                     status="No submissions JSON",
                     as_of=as_of,
                 )
@@ -1187,126 +1344,253 @@ def main() -> None:
                     "G1_Latest_10K": None,
                     "G1_Latest_10Q": None,
                     "G1_Latest_20F": None,
+
+                    "G2_Pass_Basics": "FALSE",
+                    "G2_Reason": "FAIL: Gate 1 failed (no submissions)",
+                    "G2_Revenue_Positive": None,
+                    "G2_Shares_Exists": None,
+                    "G2_CashOrOCF_Exists": None,
+                    "G2_MarketCap_Over_10B": None,
+                    "G2_MarketCap_USD": None,
+
+                    "P_Close_Price_USD": None,
+                    "P_Price_Date": None,
+                    "P_Market_Cap_USD": None,
+                    "P_MarketCap_Method": None,
                 })
                 out_rows.append(out)
                 continue
-
 
             sic, sic_desc = extract_sic(submissions)
             is_ad = (sic in sic_allow) if sic is not None else False
 
             out = build_base_row(
-                ticker=t, cik10=cik10, name=name, sic=sic, sic_desc=sic_desc, is_ad=is_ad,
+                ticker=t,
+                cik10=cik10,
+                name=name,
+                sic=sic,
+                sic_desc=sic_desc,
+                is_ad=is_ad,
                 status="OK",
                 as_of=as_of,
             )
+
             # -----------------------------
-            # Gate 1: if not a real/active filer, stop immediately
+            # Gate 1: reporting recency
             # -----------------------------
             if ENABLE_GATE_1:
-                passed, reason, g1_fields = gate1_reporting(submissions)
+                g1_passed, _, g1_fields = gate1_reporting(submissions)
                 out.update(g1_fields)
-
-                if not passed:
+                if not g1_passed:
                     out["Status"] = "Excluded (Gate 1)"
+                    out.update({
+                        "G2_Pass_Basics": "FALSE",
+                        "G2_Reason": "FAIL: Gate 1 failed",
+                        "G2_Revenue_Positive": None,
+                        "G2_Shares_Exists": None,
+                        "G2_CashOrOCF_Exists": None,
+                        "G2_MarketCap_Over_10B": None,
+                        "G2_MarketCap_USD": None,
+
+                        "P_Close_Price_USD": None,
+                        "P_Price_Date": None,
+                        "P_Market_Cap_USD": None,
+                        "P_MarketCap_Method": None,
+                    })
                     out_rows.append(out)
                     continue
 
+            # -----------------------------
+            # Gate 2: minimum companyfacts, then optional market cap kill
+            # -----------------------------
+            facts = fetch_company_facts(cik10)
+            if not facts:
+                out["Status"] = "Excluded (Gate 2)"
+                out.update({
+                    "G2_Pass_Basics": "FALSE",
+                    "G2_Reason": "FAIL: Missing companyfacts",
+                    "G2_Revenue_Positive": None,
+                    "G2_Shares_Exists": None,
+                    "G2_CashOrOCF_Exists": None,
+                    "G2_MarketCap_Over_10B": None,
+                    "G2_MarketCap_USD": None,
 
-            # Tier C (filing-type signals)
+                    "P_Close_Price_USD": None,
+                    "P_Price_Date": None,
+                    "P_Market_Cap_USD": None,
+                    "P_MarketCap_Method": None,
+                })
+                out_rows.append(out)
+                continue
+
+            # Gate 2 “min” metrics (no Yahoo yet)
+            try:
+                out.update(tier_a_min_metrics(facts))
+            except Exception:
+                # If min parsing fails, treat as Gate 2 fail (cannot screen)
+                out["Status"] = "Excluded (Gate 2)"
+                out.update({
+                    "G2_Pass_Basics": "FALSE",
+                    "G2_Reason": "FAIL: Could not parse minimum fundamentals",
+                    "G2_Revenue_Positive": None,
+                    "G2_Shares_Exists": None,
+                    "G2_CashOrOCF_Exists": None,
+                    "G2_MarketCap_Over_10B": None,
+                    "G2_MarketCap_USD": None,
+
+                    "P_Close_Price_USD": None,
+                    "P_Price_Date": None,
+                    "P_Market_Cap_USD": None,
+                    "P_MarketCap_Method": None,
+                })
+                out_rows.append(out)
+                continue
+
+            # Prelim Gate 2 checks (still no Yahoo)
+            rev = safe_float(out.get("A_TTM_Revenue_USD"))
+            shares = safe_float(out.get("A_Shares_Outstanding"))
+            cash = safe_float(out.get("A_Cash_USD"))
+            ocf = safe_float(out.get("A_TTM_OCF_USD"))
+
+            prelim_revenue_ok = (rev is not None and rev > 0)
+            prelim_shares_ok = (shares is not None and shares > 0)
+            prelim_cash_or_ocf_ok = ((cash is not None and cash > 0) or (ocf is not None))
+
+            if not (prelim_revenue_ok and prelim_shares_ok and prelim_cash_or_ocf_ok):
+                # Fail Gate 2 without calling Yahoo
+                out.update({
+                    "P_Close_Price_USD": None,
+                    "P_Price_Date": None,
+                    "P_Market_Cap_USD": None,
+                    "P_MarketCap_Method": None,
+                })
+                g2_passed, _, g2_fields = gate2_basics(out)
+                out.update(g2_fields)
+                out["Status"] = "Excluded (Gate 2)"
+                out_rows.append(out)
+                continue
+
+            # Only now: compute market cap (Yahoo) and apply threshold
+            out.update(compute_market_cap_from_out(out, t))
+            g2_passed, _, g2_fields = gate2_basics(out)
+            out.update(g2_fields)
+
+            if ENABLE_GATE_2 and not g2_passed:
+                out["Status"] = "Excluded (Gate 2)"
+                out_rows.append(out)
+                continue
+
+            # -----------------------------
+            # Tiers (only for Gate-2 passers)
+            # -----------------------------
+
+            # Tier C (submissions-derived signals)
             tier_c: Dict[str, Any] = {}
             if ENABLE_TIER_C:
                 try:
                     tier_c = tier_c_metrics(submissions)
-                    # write only non-internal keys
                     for k, v in tier_c.items():
                         if not k.startswith("_"):
                             out[k] = v
                 except Exception:
                     out["Status"] = "OK (Tier C partial)"
 
-            # Tier A (XBRL/DEI)
-            if ENABLE_TIER_A:
+            # Tier A full (reuse facts)
+            if ENABLE_TIER_A_FULL:
                 try:
-                    facts = fetch_company_facts(cik10)
-                    if facts:
-                        a = tier_a_metrics(facts)
-                        out.update(a)
-
-                        # Tier P: Market cap (price × shares outstanding)
-                        try:
-                            shares = safe_float(out.get("A_Shares_Outstanding"))
-                            shares_date = out.get("A_Shares_AsOf")
-
-                            price = None
-                            price_date = None
-                            mcap = None
-
-                            if shares and shares_date:
-                                price_date = parse_date(shares_date)
-                                if price_date:
-                                    price = yahoo_close_on_date(t, price_date)
-                                    if price is not None:
-                                        mcap = price * shares
-
-                            out["P_Close_Price_USD"] = price
-                            out["P_Price_Date"] = price_date.isoformat() if price_date else None
-                            out["P_Market_Cap_USD"] = mcap
-                            out["P_MarketCap_Method"] = (
-                                "Yahoo Close × EDGAR Shares" if mcap is not None else None
-                            )
-                        except Exception:
-                            pass
-
-                    else:
-                        out["Status"] = "OK (Tier A missing: companyfacts)"
+                    out.update(tier_a_full_metrics(facts))
                 except Exception:
-                    out["Status"] = "OK (Tier A partial)"
+                    out["Status"] = "OK (Tier A full partial)"
 
-
-            # Tier B (Form 4 parsing) - best effort
+            # Tier B (Form 4 parsing) needs tier_c internals
             if ENABLE_TIER_B and tier_c:
                 try:
                     b = tier_b_metrics_from_recent_forms(cik10, tier_c)
                     out.update(b)
                 except Exception:
-                    # Do not downgrade run; just leave N/A fields
                     out["Status"] = out.get("Status") or "OK (Tier B partial)"
 
-            # Optional: add your flag logic as derived fields (examples)
-            # Keep these in-script so they never crash if inputs are N/A
+            # Example derived flags (kept, but only after gates)
             try:
-                ttm_rev = safe_float(out.get("A_TTM_Revenue_USD"))
-                out["F_TTM_Revenue_lt_500m"] = "TRUE" if (ttm_rev is not None and ttm_rev < 500_000_000) else "FALSE" if ttm_rev is not None else None
+                ttm_rev2 = safe_float(out.get("A_TTM_Revenue_USD"))
+                out["F_TTM_Revenue_lt_500m"] = (
+                    "TRUE" if (ttm_rev2 is not None and ttm_rev2 < 500_000_000)
+                    else "FALSE" if ttm_rev2 is not None else None
+                )
 
                 yoy = safe_float(out.get("A_Revenue_YoY_Growth"))
-                out["F_YoY_Abs_gt_40pct"] = "TRUE" if (yoy is not None and abs(yoy) > 0.40) else "FALSE" if yoy is not None else None
+                out["F_YoY_Abs_gt_40pct"] = (
+                    "TRUE" if (yoy is not None and abs(yoy) > 0.40)
+                    else "FALSE" if yoy is not None else None
+                )
 
                 opm = safe_float(out.get("A_Operating_Margin"))
-                out["F_OpMargin_lt_neg10pct"] = "TRUE" if (opm is not None and opm < -0.10) else "FALSE" if opm is not None else None
+                out["F_OpMargin_lt_neg10pct"] = (
+                    "TRUE" if (opm is not None and opm < -0.10)
+                    else "FALSE" if opm is not None else None
+                )
 
                 rnd = safe_float(out.get("A_RnD_Intensity"))
-                out["F_RnD_gt_20pct"] = "TRUE" if (rnd is not None and rnd > 0.20) else "FALSE" if rnd is not None else None
+                out["F_RnD_gt_20pct"] = (
+                    "TRUE" if (rnd is not None and rnd > 0.20)
+                    else "FALSE" if rnd is not None else None
+                )
 
                 sga = safe_float(out.get("A_SGandA_Intensity"))
-                out["F_SGandA_gt_50pct"] = "TRUE" if (sga is not None and sga > 0.50) else "FALSE" if sga is not None else None
+                out["F_SGandA_gt_50pct"] = (
+                    "TRUE" if (sga is not None and sga > 0.50)
+                    else "FALSE" if sga is not None else None
+                )
 
                 cr = safe_float(out.get("A_Current_Ratio"))
-                out["F_CurrentRatio_lt_1_5"] = "TRUE" if (cr is not None and cr < 1.5) else "FALSE" if cr is not None else None
+                out["F_CurrentRatio_lt_1_5"] = (
+                    "TRUE" if (cr is not None and cr < 1.5)
+                    else "FALSE" if cr is not None else None
+                )
 
                 de = safe_float(out.get("A_Debt_to_Equity"))
-                out["F_DebtEq_gt_1_0"] = "TRUE" if (de is not None and de > 1.0) else "FALSE" if de is not None else None
+                out["F_DebtEq_gt_1_0"] = (
+                    "TRUE" if (de is not None and de > 1.0)
+                    else "FALSE" if de is not None else None
+                )
             except Exception:
                 pass
 
             out_rows.append(out)
 
         except Exception:
-            out_rows.append(build_base_row(
-                ticker=t, cik10=cik10, name=name, sic=None, sic_desc=None, is_ad=None,
+            # Hard-fail safe row
+            out = build_base_row(
+                ticker=t,
+                cik10=cik10,
+                name=name,
+                sic=None,
+                sic_desc=None,
+                is_ad=None,
                 status="Failed (unexpected error in company loop)",
                 as_of=as_of,
-            ))
+            )
+            out.update({
+                "G1_Pass_Reporting": "FALSE",
+                "G1_Reason": "FAIL: Unexpected error",
+                "G1_Latest_10K": None,
+                "G1_Latest_10Q": None,
+                "G1_Latest_20F": None,
+
+                "G2_Pass_Basics": "FALSE",
+                "G2_Reason": "FAIL: Unexpected error",
+                "G2_Revenue_Positive": None,
+                "G2_Shares_Exists": None,
+                "G2_CashOrOCF_Exists": None,
+                "G2_MarketCap_Over_10B": None,
+                "G2_MarketCap_USD": None,
+
+                "P_Close_Price_USD": None,
+                "P_Price_Date": None,
+                "P_Market_Cap_USD": None,
+                "P_MarketCap_Method": None,
+            })
+            out_rows.append(out)
 
     write_company_dicts_to_excel(OUTPUT_XLSX, out_rows)
 

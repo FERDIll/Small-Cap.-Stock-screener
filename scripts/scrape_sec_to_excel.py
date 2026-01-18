@@ -45,6 +45,9 @@ import requests
 from openpyxl import Workbook, load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 
+SEC_SESSION = requests.Session()
+YAHOO_SESSION = requests.Session()
+
 
 # -----------------------------
 # Configuration
@@ -87,7 +90,8 @@ SEC_ARCHIVES_PRIMARYDOC_TMPL = (
 # IMPORTANT: SEC requests a real UA with contact info
 USER_AGENT = "Ferdinand Niggemeier Small-Cap Stock Screener (Niggemeier.Ferdinand@gmail.com)"
 
-SECONDS_BETWEEN_REQUESTS = 0.2
+SEC_SECONDS_BETWEEN_REQUESTS = 0.20
+YAHOO_SECONDS_BETWEEN_REQUESTS = 0.00   # set 0.02 if you prefer
 HTTP_TIMEOUT = 30
 
 # Gate 1 windows (tighter)
@@ -155,8 +159,11 @@ def ticker_variants(t: str) -> List[str]:
     return out
 
 
-def sleep_rate_limit() -> None:
-    time.sleep(SECONDS_BETWEEN_REQUESTS)
+def sleep_sec() -> None:
+    time.sleep(SEC_SECONDS_BETWEEN_REQUESTS)
+
+def sleep_yahoo() -> None:
+    time.sleep(YAHOO_SECONDS_BETWEEN_REQUESTS)
 
 
 def parse_date(s: str) -> Optional[date]:
@@ -321,8 +328,15 @@ def _sec_http_headers() -> Dict[str, str]:
     }
 
 
-def get_json_cached(url: str, cache_key: str, *, headers: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
-    """Fetch JSON with a simple on-disk cache. Returns None on failure."""
+def get_json_cached(
+    url: str,
+    cache_key: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    session: Optional[requests.Session] = None,
+    sleep_fn = None,
+) -> Optional[Dict[str, Any]]:
+    """Fetch JSON with on-disk cache. Returns None on failure."""
     cache_path = CACHE_DIR / f"{cache_key}.json"
     if cache_path.exists() and cache_path.stat().st_size > 10:
         try:
@@ -331,8 +345,10 @@ def get_json_cached(url: str, cache_key: str, *, headers: Optional[Dict[str, str
             pass
 
     try:
-        resp = requests.get(url, headers=headers or _sec_http_headers(), timeout=HTTP_TIMEOUT)
-        sleep_rate_limit()
+        sess = session or SEC_SESSION
+        hdrs = headers or _sec_http_headers()
+        resp = sess.get(url, headers=hdrs, timeout=HTTP_TIMEOUT)
+        (sleep_fn or sleep_sec)()
         resp.raise_for_status()
         data = resp.json()
         cache_path.write_text(json.dumps(data), encoding="utf-8")
@@ -342,7 +358,7 @@ def get_json_cached(url: str, cache_key: str, *, headers: Optional[Dict[str, str
 
 
 def get_text(url: str, cache_key: str) -> Optional[str]:
-    """Fetch text (e.g., Form 4 XML) with cache. Returns None on failure."""
+    """Fetch SEC text (e.g., Form 4 XML) with cache. Returns None on failure."""
     cache_path = CACHE_DIR / f"{cache_key}.txt"
     if cache_path.exists() and cache_path.stat().st_size > 10:
         try:
@@ -351,8 +367,8 @@ def get_text(url: str, cache_key: str) -> Optional[str]:
             pass
 
     try:
-        resp = requests.get(url, headers=_sec_http_headers(), timeout=HTTP_TIMEOUT)
-        sleep_rate_limit()
+        resp = SEC_SESSION.get(url, headers=_sec_http_headers(), timeout=HTTP_TIMEOUT)
+        sleep_sec()
         resp.raise_for_status()
         text = resp.text
         cache_path.write_text(text, encoding="utf-8")
@@ -726,7 +742,7 @@ def gate2_basics(out: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
 # Gate 3: Market cap + liquidity (Yahoo fetched last, single call)
 # -----------------------------
 
-def yahoo_quote_and_liquidity(ticker: str, *, adv_days: int = 30, lookback_days: int = 120) -> Dict[str, Any]:
+def yahoo_quote_and_liquidity(ticker: str, *, adv_days: int = 30, lookback_days: int = 70) -> Dict[str, Any]:
     """
     One Yahoo chart call (disk-cached per ticker per day):
       - last_close, last_date
@@ -749,7 +765,15 @@ def yahoo_quote_and_liquidity(ticker: str, *, adv_days: int = 30, lookback_days:
     cache_key = f"yahoo_chart_{yahoo_ticker}_{end.isoformat()}"
     headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*"}
 
-    j = get_json_cached(url, cache_key=cache_key, headers=headers)
+    j = get_json_cached(
+        url,
+        cache_key=cache_key,
+        headers=headers,
+        session=YAHOO_SESSION,
+        sleep_fn=sleep_yahoo,
+    )
+
+
     if not j:
         return {"P_Close_Price_USD": None, "P_Price_Date": None, "ADV30_Shares": None, "ADV30_Dollar": None}
 
@@ -1375,7 +1399,6 @@ def build_base_row(
         "CIK": cik10,
         "SIC": sic,
         "SIC Description": sic_desc,
-        "Aerospace & Defense": "TRUE" if is_ad else ("FALSE" if is_ad is not None else None),
         "Data As-Of Date": as_of,
         "Run Timestamp (UTC)": now_iso(),
         "Status": status,
@@ -1384,7 +1407,6 @@ def build_base_row(
 
 def main() -> None:
     ensure_output_workbook()
-    sic_allow = load_sic_allowlist()
 
     universe_path = resolve_universe_input()
     tickers = load_tickers_any(universe_path)
@@ -1460,7 +1482,7 @@ def main() -> None:
                 continue
 
             sic, sic_desc = extract_sic(submissions)
-            is_ad = (sic in sic_allow) if sic is not None else False
+            is_ad = None
 
             out = build_base_row(
                 ticker=t,

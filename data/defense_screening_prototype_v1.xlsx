@@ -15,7 +15,6 @@ ws.append([
     "CIK",
     "SIC",
     "SIC Description",
-    "Aerospace & Defense",
     "Data As-Of Date"
 ])
 

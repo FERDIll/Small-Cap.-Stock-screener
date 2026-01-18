@@ -2,17 +2,21 @@
 """
 SEC small-cap screener scraper (gated, tiered, failure-tolerant)
 
-Pipeline per ticker (efficiency-first):
+Pipeline per ticker (efficiency-first, with strict “fetch last” for market data):
+
 1) Gate 1 (submissions only): Must be a recent filer (10-K / 10-Q / 20-F).
    - If FAIL: write row + Gate 1 fields, stop.
 
-2) Gate 2 (companyfacts minimum): Must be "screenable" for this model.
-   - Requires: Revenue > 0, Shares outstanding > 0, and (Cash > 0 OR OCF exists).
-   - Only if those prelim checks pass do we compute Market Cap (Yahoo close × EDGAR shares)
-     and FAIL if Market Cap > $10B.
+2) Gate 2 (companyfacts only): Must be “screenable” with tighter EDGAR-only fundamentals.
    - If FAIL: write row + Gate 2 fields, stop.
+   - No Yahoo / no market cap / no volume fetched here.
 
-3) Tiers (only for Gate-2 passers):
+3) Gate 3 (Yahoo fetched LAST, single call):
+   - Compute Market Cap (Yahoo last close × EDGAR shares) and require <= $5B
+   - Liquidity kill-switch (tight): ADV30 >= 200k shares AND $ADV30 >= $2m
+   - If FAIL: write row + Gate 3 fields, stop.
+
+4) Tiers (only for Gate-3 passers):
    - Tier C: filing-type signals (submissions)
    - Tier A: full XBRL/DEI metrics (companyfacts) (reusing fetched facts)
    - Tier B: insider Form 4 parsing (best-effort)
@@ -21,6 +25,8 @@ Design goals:
 - Never crash the run because one company is missing data.
 - Any missing/failed datapoint becomes "N/A" in the output workbook.
 - Update existing rows by ticker instead of only appending.
+- Recycle fetched data: submissions and companyfacts are fetched once per CIK (disk-cached);
+  Yahoo market data is fetched once per ticker per run-day (disk-cached).
 """
 
 from __future__ import annotations
@@ -66,6 +72,7 @@ UNIVERSE_CANDIDATES = [
 UNIVERSE_SHEET = "Universe"
 UNIVERSE_TICKER_HEADER = "ticker"  # case-insensitive
 
+# Optional SIC config (not used as a hard gate in this version)
 SIC_CONFIG = CONFIG_DIR / "sic_aero_defense.json"
 DEFAULT_SIC_ALLOWLIST = [3480, 3720, 3721, 3724, 3728, 3760, 3812]
 
@@ -83,16 +90,24 @@ USER_AGENT = "Ferdinand Niggemeier Small-Cap Stock Screener (Niggemeier.Ferdinan
 SECONDS_BETWEEN_REQUESTS = 0.2
 HTTP_TIMEOUT = 30
 
-# Gate 1 windows (tweak anytime)
-G1_MAX_AGE_10K_DAYS = 18 * 30  # ~18 months
-G1_MAX_AGE_10Q_DAYS = 9 * 30   # ~9 months
-G1_MAX_AGE_20F_DAYS = 24 * 30  # ~24 months
+# Gate 1 windows (tighter)
+G1_MAX_AGE_10K_DAYS = 15 * 30  # ~15 months
+G1_MAX_AGE_10Q_DAYS = 6 * 30   # ~6 months
+G1_MAX_AGE_20F_DAYS = 18 * 30  # ~18 months
 
 ENABLE_GATE_1 = True
 ENABLE_GATE_2 = True
+ENABLE_GATE_3 = True
 
-# Gate 2 market cap threshold
-G2_MAX_MARKET_CAP_USD = 10_000_000_000
+# Gate 2 (tight, EDGAR-only)
+G2_MIN_TTM_REVENUE_USD = 25_000_000
+G2_MIN_TOTAL_ASSETS_USD = 50_000_000
+G2_MIN_CASH_USD = 5_000_000
+
+# Gate 3 (fetched last)
+G3_MAX_MARKET_CAP_USD = 5_000_000_000
+G3_MIN_ADV30_SHARES = 200_000
+G3_MIN_ADV30_DOLLAR = 2_000_000
 
 # Switches: tiers (only run after gates pass)
 ENABLE_TIER_A_FULL = True
@@ -118,6 +133,26 @@ def clean_ticker(raw: str) -> Optional[str]:
     if not TICKER_RE.match(t):
         return None
     return t
+
+
+def ticker_variants(t: str) -> List[str]:
+    """
+    Try a small set of common symbol variations to improve SEC ticker map hit-rate.
+    """
+    t = (t or "").strip().upper()
+    if not t:
+        return []
+    variants = [t]
+    variants.append(t.replace(".", "-"))
+    variants.append(t.replace("-", "."))
+    # Deduplicate preserving order
+    out: List[str] = []
+    seen = set()
+    for x in variants:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
 
 
 def sleep_rate_limit() -> None:
@@ -154,7 +189,7 @@ def normalize_header(s: str) -> str:
 
 
 # -----------------------------
-# Config: SIC allowlist
+# Config: SIC allowlist (optional)
 # -----------------------------
 
 def ensure_sic_config() -> None:
@@ -279,14 +314,14 @@ def load_tickers_any(path: Path) -> List[str]:
 # SEC fetch helpers (cached, safe)
 # -----------------------------
 
-def _http_headers() -> Dict[str, str]:
+def _sec_http_headers() -> Dict[str, str]:
     return {
         "User-Agent": USER_AGENT,
         "Accept-Encoding": "gzip, deflate",
     }
 
 
-def get_json_cached(url: str, cache_key: str) -> Optional[Dict[str, Any]]:
+def get_json_cached(url: str, cache_key: str, *, headers: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
     """Fetch JSON with a simple on-disk cache. Returns None on failure."""
     cache_path = CACHE_DIR / f"{cache_key}.json"
     if cache_path.exists() and cache_path.stat().st_size > 10:
@@ -296,7 +331,7 @@ def get_json_cached(url: str, cache_key: str) -> Optional[Dict[str, Any]]:
             pass
 
     try:
-        resp = requests.get(url, headers=_http_headers(), timeout=HTTP_TIMEOUT)
+        resp = requests.get(url, headers=headers or _sec_http_headers(), timeout=HTTP_TIMEOUT)
         sleep_rate_limit()
         resp.raise_for_status()
         data = resp.json()
@@ -316,67 +351,12 @@ def get_text(url: str, cache_key: str) -> Optional[str]:
             pass
 
     try:
-        resp = requests.get(url, headers=_http_headers(), timeout=HTTP_TIMEOUT)
+        resp = requests.get(url, headers=_sec_http_headers(), timeout=HTTP_TIMEOUT)
         sleep_rate_limit()
         resp.raise_for_status()
         text = resp.text
         cache_path.write_text(text, encoding="utf-8")
         return text
-    except Exception:
-        return None
-
-
-def yahoo_close_on_date(ticker: str, target_date: date) -> Optional[float]:
-    """
-    Yahoo chart endpoint (JSON) - no API key.
-    Returns the close on target_date, or nearest prior trading day within lookback.
-    """
-    yahoo_ticker = ticker.replace(".", "-")
-    start = target_date - timedelta(days=7)
-    end = target_date + timedelta(days=1)
-
-    period1 = int(time.mktime(start.timetuple()))
-    period2 = int(time.mktime(end.timetuple()))
-
-    url = (
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_ticker}"
-        f"?period1={period1}&period2={period2}&interval=1d"
-    )
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json,text/plain,*/*",
-    }
-
-    try:
-        r = requests.get(url, headers=headers, timeout=20)
-        sleep_rate_limit()
-        r.raise_for_status()
-        j = r.json()
-
-        result = (j.get("chart") or {}).get("result") or []
-        if not result:
-            return None
-
-        res0 = result[0]
-        ts = res0.get("timestamp") or []
-        closes = (((res0.get("indicators") or {}).get("quote") or [{}])[0]).get("close") or []
-
-        d2c: Dict[date, float] = {}
-        for tstamp, c in zip(ts, closes):
-            if c is None:
-                continue
-            d = datetime.fromtimestamp(int(tstamp), tz=timezone.utc).date()
-            d2c[d] = float(c)
-
-        if target_date in d2c:
-            return d2c[target_date]
-
-        for k in sorted(d2c.keys(), reverse=True):
-            if k <= target_date:
-                return d2c[k]
-
-        return None
     except Exception:
         return None
 
@@ -393,6 +373,17 @@ def build_ticker_to_cik_map() -> Dict[str, Tuple[str, str]]:
         if ticker and cik_str.isdigit():
             mapping[ticker] = (cik_str.zfill(10), title)
     return mapping
+
+
+def resolve_cik_from_map(ticker: str, t2c: Dict[str, Tuple[str, str]]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Returns (matched_ticker, cik10, name) or (None, None, None).
+    """
+    for tv in ticker_variants(ticker):
+        if tv in t2c:
+            cik10, name = t2c[tv]
+            return tv, cik10, name
+    return None, None, None
 
 
 def fetch_company_submissions(cik10: str) -> Optional[Dict[str, Any]]:
@@ -502,6 +493,11 @@ GAAP_TAGS = {
         "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
     ],
     "sbc": ["ShareBasedCompensation"],
+
+    # Added for tight Gate 2
+    "net_income": ["NetIncomeLoss"],
+    "gross_profit": ["GrossProfit"],
+    "assets": ["Assets"],
 }
 
 DEI_TAGS = {
@@ -574,14 +570,17 @@ def _yoy_growth(latest: float, prev: float) -> Optional[float]:
 
 
 # -----------------------------
-# Gate 2: minimum screenability (companyfacts-min)
+# Gate 2: minimum screenability (companyfacts-only, tight)
 # -----------------------------
 
 def tier_a_min_metrics(companyfacts: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Minimum subset needed for Gate 2 (fastest useful cut):
+    Minimum subset needed for Gate 2 (EDGAR-only, tight):
       - A_TTM_Revenue_USD (+ end date)
+      - A_Total_Assets_USD (+ end date)
       - A_TTM_OCF_USD
+      - A_TTM_NetIncome_USD
+      - A_TTM_GrossProfit_USD
       - A_Cash_USD (+ end date)
       - A_Shares_Outstanding (+ as-of)
     """
@@ -593,14 +592,17 @@ def tier_a_min_metrics(companyfacts: Dict[str, Any]) -> Dict[str, Any]:
 
     rev_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["revenue"], forms=forms, fps=fps_flow)
     ocf_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["ocf"], forms=forms, fps=fps_flow)
+    ni_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["net_income"], forms=forms, fps=fps_flow)
+    gp_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["gross_profit"], forms=forms, fps=fps_flow)
 
     cash_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["cash_st_inv"], forms=forms, fps=fps_inst)
     if not cash_points:
         cash_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["cash"], forms=forms, fps=fps_inst)
 
+    assets_points = _pick_period_points(companyfacts, "us-gaap", GAAP_TAGS["assets"], forms=forms, fps=fps_inst)
     shares_points = _pick_period_points(companyfacts, "dei", DEI_TAGS["shares_out"], forms=forms, fps=fps_inst)
 
-    # TTM-ish revenue: prefer last 4 points, else latest FY
+    # TTM-ish revenue
     ttm_rev = None
     ttm_rev_end = None
     if len(rev_points) >= 4:
@@ -613,11 +615,10 @@ def tier_a_min_metrics(companyfacts: Dict[str, Any]) -> Dict[str, Any]:
             last = fy[-1]
             ttm_rev = safe_float(last.get("val"))
             ttm_rev_end = last.get("end")
-
     out["A_TTM_Revenue_USD"] = ttm_rev
     out["A_TTM_Revenue_End"] = ttm_rev_end
 
-    # TTM-ish OCF: prefer last 4, else latest FY
+    # TTM-ish OCF
     ttm_ocf = None
     if len(ocf_points) >= 4:
         ttm_ocf = _sum_vals(_latest_four_quarters(ocf_points))
@@ -626,6 +627,26 @@ def tier_a_min_metrics(companyfacts: Dict[str, Any]) -> Dict[str, Any]:
         if fy:
             ttm_ocf = safe_float(fy[-1].get("val"))
     out["A_TTM_OCF_USD"] = ttm_ocf
+
+    # TTM-ish Net Income
+    ttm_ni = None
+    if len(ni_points) >= 4:
+        ttm_ni = _sum_vals(_latest_four_quarters(ni_points))
+    else:
+        fy = [p for p in ni_points if p.get("fp") == "FY"]
+        if fy:
+            ttm_ni = safe_float(fy[-1].get("val"))
+    out["A_TTM_NetIncome_USD"] = ttm_ni
+
+    # TTM-ish Gross Profit
+    ttm_gp = None
+    if len(gp_points) >= 4:
+        ttm_gp = _sum_vals(_latest_four_quarters(gp_points))
+    else:
+        fy = [p for p in gp_points if p.get("fp") == "FY"]
+        if fy:
+            ttm_gp = safe_float(fy[-1].get("val"))
+    out["A_TTM_GrossProfit_USD"] = ttm_gp
 
     # Cash (latest instant)
     cash_latest = None
@@ -637,6 +658,16 @@ def tier_a_min_metrics(companyfacts: Dict[str, Any]) -> Dict[str, Any]:
     out["A_Cash_USD"] = cash_latest
     out["A_Cash_End"] = cash_end
 
+    # Total Assets (latest instant)
+    assets_latest = None
+    assets_end = None
+    ai = _latest_instant(assets_points)
+    if ai:
+        assets_latest = safe_float(ai.get("val"))
+        assets_end = ai.get("end")
+    out["A_Total_Assets_USD"] = assets_latest
+    out["A_Total_Assets_End"] = assets_end
+
     # Shares outstanding (latest)
     sh = _latest_instant(shares_points)
     out["A_Shares_Outstanding"] = safe_float(sh.get("val")) if sh else None
@@ -645,101 +676,167 @@ def tier_a_min_metrics(companyfacts: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def compute_market_cap_from_out(out: Dict[str, Any], ticker: str) -> Dict[str, Any]:
-    """
-    Compute market cap (Yahoo close × EDGAR shares) using existing out fields.
-    Returns P_* fields. Never raises.
-    """
-    try:
-        shares = safe_float(out.get("A_Shares_Outstanding"))
-        shares_date = out.get("A_Shares_AsOf")
-
-        price = None
-        price_date = None
-        mcap = None
-
-        if shares and shares_date:
-            price_date = parse_date(str(shares_date))
-            if price_date:
-                price = yahoo_close_on_date(ticker, price_date)
-                if price is not None:
-                    mcap = price * shares
-
-        return {
-            "P_Close_Price_USD": price,
-            "P_Price_Date": price_date.isoformat() if price_date else None,
-            "P_Market_Cap_USD": mcap,
-            "P_MarketCap_Method": "Yahoo Close × EDGAR Shares" if mcap is not None else None,
-        }
-    except Exception:
-        return {
-            "P_Close_Price_USD": None,
-            "P_Price_Date": None,
-            "P_Market_Cap_USD": None,
-            "P_MarketCap_Method": None,
-        }
-
-
 def gate2_basics(out: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
     """
-    Gate 2: screenability for this model.
-
-    Requirements:
-      - Revenue exists and > 0 (A_TTM_Revenue_USD)
-      - Shares outstanding exists and > 0 (A_Shares_Outstanding)
-      - Cash > 0 OR operating cash flow exists (A_Cash_USD OR A_TTM_OCF_USD)
-      - If market cap exists and > $10B => FAIL (market cap is computed only after prelim pass)
+    Gate 2 (tight, EDGAR-only):
+      - (TTM Revenue >= $25m OR Total Assets >= $50m)
+      - Shares outstanding > 0
+      - Operating reality exists: at least one of (TTM OCF, TTM Net Income, TTM Gross Profit) is non-null
+      - Cash >= $5m OR TTM OCF exists
     """
     rev = safe_float(out.get("A_TTM_Revenue_USD"))
+    assets = safe_float(out.get("A_Total_Assets_USD"))
     shares = safe_float(out.get("A_Shares_Outstanding"))
+
     cash = safe_float(out.get("A_Cash_USD"))
     ocf = safe_float(out.get("A_TTM_OCF_USD"))
-    mcap = safe_float(out.get("P_Market_Cap_USD"))
+    ni = safe_float(out.get("A_TTM_NetIncome_USD"))
+    gp = safe_float(out.get("A_TTM_GrossProfit_USD"))
 
-    revenue_ok = (rev is not None and rev > 0)
+    size_ok = ((rev is not None and rev >= G2_MIN_TTM_REVENUE_USD) or (assets is not None and assets >= G2_MIN_TOTAL_ASSETS_USD))
     shares_ok = (shares is not None and shares > 0)
-    cash_or_ocf_ok = ((cash is not None and cash > 0) or (ocf is not None))
+    operating_exists = (ocf is not None) or (ni is not None) or (gp is not None)
+    cash_or_ocf_ok = ((cash is not None and cash >= G2_MIN_CASH_USD) or (ocf is not None))
 
-    # Market cap threshold only applies if we managed to compute it
-    mcap_over = None
-    if mcap is not None:
-        mcap_over = (mcap > G2_MAX_MARKET_CAP_USD)
+    passed = size_ok and shares_ok and operating_exists and cash_or_ocf_ok
 
-    passed = revenue_ok and shares_ok and cash_or_ocf_ok and (mcap_over is not True)
-
-    if not revenue_ok:
-        reason = "FAIL: Revenue missing or <= 0"
+    if not size_ok:
+        reason = f"FAIL: Too small (Rev<{G2_MIN_TTM_REVENUE_USD/1e6:.0f}m and Assets<{G2_MIN_TOTAL_ASSETS_USD/1e6:.0f}m) or missing"
     elif not shares_ok:
-        reason = "FAIL: Shares outstanding missing"
+        reason = "FAIL: Shares outstanding missing/<=0"
+    elif not operating_exists:
+        reason = "FAIL: No operating reality metric (OCF/NI/GP all missing)"
     elif not cash_or_ocf_ok:
-        reason = "FAIL: Neither cash>0 nor operating cash flow available"
-    elif mcap_over is True:
-        reason = f"FAIL: Market cap > ${G2_MAX_MARKET_CAP_USD:,.0f}"
+        reason = f"FAIL: Cash<{G2_MIN_CASH_USD/1e6:.0f}m and OCF missing"
     else:
-        reason = "PASS: Screenable fundamentals present"
+        reason = "PASS: EDGAR fundamentals screenable (tight)"
 
     extras = {
         "G2_Pass_Basics": "TRUE" if passed else "FALSE",
         "G2_Reason": reason,
-        "G2_Revenue_Positive": "TRUE" if revenue_ok else "FALSE",
-        "G2_Shares_Exists": "TRUE" if shares_ok else "FALSE",
-        "G2_CashOrOCF_Exists": "TRUE" if cash_or_ocf_ok else "FALSE",
-        "G2_MarketCap_Over_10B": (
-            "TRUE" if mcap_over is True else "FALSE" if mcap_over is False else None
-        ),
-        "G2_MarketCap_USD": mcap,
+        "G2_Size_OK": "TRUE" if size_ok else "FALSE",
+        "G2_Shares_OK": "TRUE" if shares_ok else "FALSE",
+        "G2_Operating_Exists": "TRUE" if operating_exists else "FALSE",
+        "G2_CashOrOCF_OK": "TRUE" if cash_or_ocf_ok else "FALSE",
     }
     return passed, reason, extras
 
 
 # -----------------------------
-# Tier A: FULL metrics (runs only for Gate-2 passers; reuses facts)
+# Gate 3: Market cap + liquidity (Yahoo fetched last, single call)
+# -----------------------------
+
+def yahoo_quote_and_liquidity(ticker: str, *, adv_days: int = 30, lookback_days: int = 120) -> Dict[str, Any]:
+    """
+    One Yahoo chart call (disk-cached per ticker per day):
+      - last_close, last_date
+      - ADV over last adv_days trading days (shares)
+      - $ADV over last adv_days trading days (close*volume)
+    """
+    yahoo_ticker = ticker.replace(".", "-").upper()
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=lookback_days)
+
+    period1 = int(time.mktime(start.timetuple()))
+    period2 = int(time.mktime((end + timedelta(days=1)).timetuple()))
+
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_ticker}"
+        f"?period1={period1}&period2={period2}&interval=1d"
+    )
+
+    # Cache key includes date so repeated runs same day do not re-fetch
+    cache_key = f"yahoo_chart_{yahoo_ticker}_{end.isoformat()}"
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*"}
+
+    j = get_json_cached(url, cache_key=cache_key, headers=headers)
+    if not j:
+        return {"P_Close_Price_USD": None, "P_Price_Date": None, "ADV30_Shares": None, "ADV30_Dollar": None}
+
+    result = (j.get("chart") or {}).get("result") or []
+    if not result:
+        return {"P_Close_Price_USD": None, "P_Price_Date": None, "ADV30_Shares": None, "ADV30_Dollar": None}
+
+    res0 = result[0]
+    ts = res0.get("timestamp") or []
+    quote0 = (((res0.get("indicators") or {}).get("quote") or [{}])[0])
+    closes = quote0.get("close") or []
+    vols = quote0.get("volume") or []
+
+    rows: List[Tuple[date, float, float]] = []
+    for tstamp, c, v in zip(ts, closes, vols):
+        if c is None or v is None:
+            continue
+        d = datetime.fromtimestamp(int(tstamp), tz=timezone.utc).date()
+        rows.append((d, float(c), float(v)))
+
+    if not rows:
+        return {"P_Close_Price_USD": None, "P_Price_Date": None, "ADV30_Shares": None, "ADV30_Dollar": None}
+
+    rows.sort(key=lambda x: x[0])
+    last_d, last_c, _ = rows[-1]
+
+    tail = rows[-adv_days:] if len(rows) >= adv_days else rows
+    adv_sh = (sum(r[2] for r in tail) / len(tail)) if tail else None
+    adv_dl = (sum((r[1] * r[2]) for r in tail) / len(tail)) if tail else None
+
+    return {
+        "P_Close_Price_USD": last_c,
+        "P_Price_Date": last_d.isoformat(),
+        "ADV30_Shares": adv_sh,
+        "ADV30_Dollar": adv_dl,
+    }
+
+
+def gate3_marketcap_and_liquidity(out: Dict[str, Any], ticker: str) -> Tuple[bool, str, Dict[str, Any]]:
+    shares = safe_float(out.get("A_Shares_Outstanding"))
+    q = yahoo_quote_and_liquidity(ticker)
+
+    price = safe_float(q.get("P_Close_Price_USD"))
+    adv_sh = safe_float(q.get("ADV30_Shares"))
+    adv_dl = safe_float(q.get("ADV30_Dollar"))
+
+    mcap = None
+    if shares is not None and price is not None:
+        mcap = shares * price
+
+    mcap_ok = (mcap is not None and mcap <= G3_MAX_MARKET_CAP_USD)
+    liq_ok = (
+        adv_sh is not None and adv_sh >= G3_MIN_ADV30_SHARES
+        and adv_dl is not None and adv_dl >= G3_MIN_ADV30_DOLLAR
+    )
+
+    passed = mcap_ok and liq_ok
+
+    if mcap is None:
+        reason = "FAIL: Could not compute market cap (missing price or shares)"
+    elif not mcap_ok:
+        reason = f"FAIL: Market cap > ${G3_MAX_MARKET_CAP_USD:,.0f}"
+    elif not liq_ok:
+        reason = f"FAIL: Illiquid (ADV30<{G3_MIN_ADV30_SHARES:,} or $ADV30<${G3_MIN_ADV30_DOLLAR:,.0f})"
+    else:
+        reason = "PASS: Market cap + liquidity (tight)"
+
+    extras = {
+        "G3_Pass": "TRUE" if passed else "FALSE",
+        "G3_Reason": reason,
+        "P_Close_Price_USD": q.get("P_Close_Price_USD"),
+        "P_Price_Date": q.get("P_Price_Date"),
+        "P_Market_Cap_USD": mcap,
+        "P_MarketCap_Method": "Yahoo Last Close × EDGAR Shares" if mcap is not None else None,
+        "P_ADV30_Shares": adv_sh,
+        "P_ADV30_Dollar": adv_dl,
+    }
+    return passed, reason, extras
+
+
+# -----------------------------
+# Tier A: FULL metrics (reuses facts)
 # -----------------------------
 
 def tier_a_full_metrics(companyfacts: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Full Tier A metrics (same spirit as your original tier_a_metrics), but WITHOUT market cap.
-    Market cap is handled by Gate 2 (recycled).
+    Full Tier A metrics (best-effort). Market cap handled in Gate 3.
     """
     out: Dict[str, Any] = {}
 
@@ -767,7 +864,7 @@ def tier_a_full_metrics(companyfacts: Dict[str, Any]) -> Dict[str, Any]:
 
     shares_points = _pick_period_points(companyfacts, "dei", DEI_TAGS["shares_out"], forms=forms, fps=fps_inst)
 
-    # TTM revenue and YoY growth (best-effort)
+    # TTM revenue and YoY growth
     ttm_rev = None
     ttm_rev_end = None
     if len(rev_points) >= 4:
@@ -803,7 +900,7 @@ def tier_a_full_metrics(companyfacts: Dict[str, Any]) -> Dict[str, Any]:
             op_margin = op_last / rev_last
     out["A_Operating_Margin"] = op_margin
 
-    # Intensities (latest)
+    # Intensities
     rnd_int = None
     if rev_points and rnd_points:
         rev_last = safe_float(rev_points[-1].get("val"))
@@ -944,7 +1041,6 @@ def tier_c_metrics(submissions: Dict[str, Any]) -> Dict[str, Any]:
     out["C_Latest_10K_Date"] = latest_date_for({"10-K"})
     out["C_Latest_Shelf_Date"] = latest_date_for({"S-3", "S-3/A", "S-1", "S-1/A"})
     out["C_Latest_Form4_Date"] = latest_date_for({"4", "4/A"})
-
     out["C_Recent_Filings_Listed"] = len(forms)
 
     # Internal arrays for Tier B
@@ -1103,20 +1199,38 @@ BASE_HEADERS = [
     "G1_Latest_10Q",
     "G1_Latest_20F",
 
-    # Gate 2
+    # Gate 2 (tight, EDGAR-only)
     "G2_Pass_Basics",
     "G2_Reason",
-    "G2_Revenue_Positive",
-    "G2_Shares_Exists",
-    "G2_CashOrOCF_Exists",
-    "G2_MarketCap_Over_10B",
-    "G2_MarketCap_USD",
+    "G2_Size_OK",
+    "G2_Shares_OK",
+    "G2_Operating_Exists",
+    "G2_CashOrOCF_OK",
 
-    # Market cap fields (computed in Gate 2 path)
+    # Gate 3 (fetched last)
+    "G3_Pass",
+    "G3_Reason",
+
+    # Price / liquidity / market cap (computed in Gate 3)
     "P_Close_Price_USD",
     "P_Price_Date",
     "P_Market_Cap_USD",
     "P_MarketCap_Method",
+    "P_ADV30_Shares",
+    "P_ADV30_Dollar",
+
+    # Min EDGAR fields (useful to see why excluded)
+    "A_TTM_Revenue_USD",
+    "A_TTM_Revenue_End",
+    "A_Total_Assets_USD",
+    "A_Total_Assets_End",
+    "A_TTM_OCF_USD",
+    "A_TTM_NetIncome_USD",
+    "A_TTM_GrossProfit_USD",
+    "A_Cash_USD",
+    "A_Cash_End",
+    "A_Shares_Outstanding",
+    "A_Shares_AsOf",
 ]
 
 
@@ -1241,7 +1355,7 @@ def write_company_dicts_to_excel(xlsx_path: Path, rows: List[Dict[str, Any]]) ->
 
 
 # -----------------------------
-# Main orchestration (gates first, tiers after)
+# Main orchestration
 # -----------------------------
 
 def build_base_row(
@@ -1283,12 +1397,14 @@ def main() -> None:
     out_rows: List[Dict[str, Any]] = []
 
     for t in tickers:
-        t = t.strip().upper()
+        t = (t or "").strip().upper()
         if not t:
             continue
 
-        # --- Ticker not mapped: immediate stop (Gate 1 false, Gate 2 false) ---
-        if t not in t2c:
+        matched, cik10, name = resolve_cik_from_map(t, t2c)
+
+        # --- Ticker not mapped: immediate stop ---
+        if not cik10:
             out = build_base_row(
                 ticker=t,
                 cik10=None,
@@ -1308,21 +1424,11 @@ def main() -> None:
 
                 "G2_Pass_Basics": "FALSE",
                 "G2_Reason": "FAIL: Gate 1 failed (no CIK)",
-                "G2_Revenue_Positive": None,
-                "G2_Shares_Exists": None,
-                "G2_CashOrOCF_Exists": None,
-                "G2_MarketCap_Over_10B": None,
-                "G2_MarketCap_USD": None,
-
-                "P_Close_Price_USD": None,
-                "P_Price_Date": None,
-                "P_Market_Cap_USD": None,
-                "P_MarketCap_Method": None,
+                "G3_Pass": "FALSE",
+                "G3_Reason": "FAIL: Gate 1 failed (no CIK)",
             })
             out_rows.append(out)
             continue
-
-        cik10, name = t2c[t]
 
         try:
             # --- Gate 1 inputs: submissions JSON ---
@@ -1347,16 +1453,8 @@ def main() -> None:
 
                     "G2_Pass_Basics": "FALSE",
                     "G2_Reason": "FAIL: Gate 1 failed (no submissions)",
-                    "G2_Revenue_Positive": None,
-                    "G2_Shares_Exists": None,
-                    "G2_CashOrOCF_Exists": None,
-                    "G2_MarketCap_Over_10B": None,
-                    "G2_MarketCap_USD": None,
-
-                    "P_Close_Price_USD": None,
-                    "P_Price_Date": None,
-                    "P_Market_Cap_USD": None,
-                    "P_MarketCap_Method": None,
+                    "G3_Pass": "FALSE",
+                    "G3_Reason": "FAIL: Gate 1 failed (no submissions)",
                 })
                 out_rows.append(out)
                 continue
@@ -1376,7 +1474,7 @@ def main() -> None:
             )
 
             # -----------------------------
-            # Gate 1: reporting recency
+            # Gate 1
             # -----------------------------
             if ENABLE_GATE_1:
                 g1_passed, _, g1_fields = gate1_reporting(submissions)
@@ -1386,22 +1484,14 @@ def main() -> None:
                     out.update({
                         "G2_Pass_Basics": "FALSE",
                         "G2_Reason": "FAIL: Gate 1 failed",
-                        "G2_Revenue_Positive": None,
-                        "G2_Shares_Exists": None,
-                        "G2_CashOrOCF_Exists": None,
-                        "G2_MarketCap_Over_10B": None,
-                        "G2_MarketCap_USD": None,
-
-                        "P_Close_Price_USD": None,
-                        "P_Price_Date": None,
-                        "P_Market_Cap_USD": None,
-                        "P_MarketCap_Method": None,
+                        "G3_Pass": "FALSE",
+                        "G3_Reason": "FAIL: Gate 1 failed",
                     })
                     out_rows.append(out)
                     continue
 
             # -----------------------------
-            # Gate 2: minimum companyfacts, then optional market cap kill
+            # Gate 2 (EDGAR-only, tight)
             # -----------------------------
             facts = fetch_company_facts(cik10)
             if not facts:
@@ -1409,82 +1499,59 @@ def main() -> None:
                 out.update({
                     "G2_Pass_Basics": "FALSE",
                     "G2_Reason": "FAIL: Missing companyfacts",
-                    "G2_Revenue_Positive": None,
-                    "G2_Shares_Exists": None,
-                    "G2_CashOrOCF_Exists": None,
-                    "G2_MarketCap_Over_10B": None,
-                    "G2_MarketCap_USD": None,
-
-                    "P_Close_Price_USD": None,
-                    "P_Price_Date": None,
-                    "P_Market_Cap_USD": None,
-                    "P_MarketCap_Method": None,
+                    "G3_Pass": "FALSE",
+                    "G3_Reason": "FAIL: Gate 2 failed",
                 })
                 out_rows.append(out)
                 continue
 
-            # Gate 2 “min” metrics (no Yahoo yet)
             try:
                 out.update(tier_a_min_metrics(facts))
             except Exception:
-                # If min parsing fails, treat as Gate 2 fail (cannot screen)
                 out["Status"] = "Excluded (Gate 2)"
                 out.update({
                     "G2_Pass_Basics": "FALSE",
                     "G2_Reason": "FAIL: Could not parse minimum fundamentals",
-                    "G2_Revenue_Positive": None,
-                    "G2_Shares_Exists": None,
-                    "G2_CashOrOCF_Exists": None,
-                    "G2_MarketCap_Over_10B": None,
-                    "G2_MarketCap_USD": None,
-
-                    "P_Close_Price_USD": None,
-                    "P_Price_Date": None,
-                    "P_Market_Cap_USD": None,
-                    "P_MarketCap_Method": None,
+                    "G3_Pass": "FALSE",
+                    "G3_Reason": "FAIL: Gate 2 failed",
                 })
                 out_rows.append(out)
                 continue
 
-            # Prelim Gate 2 checks (still no Yahoo)
-            rev = safe_float(out.get("A_TTM_Revenue_USD"))
-            shares = safe_float(out.get("A_Shares_Outstanding"))
-            cash = safe_float(out.get("A_Cash_USD"))
-            ocf = safe_float(out.get("A_TTM_OCF_USD"))
-
-            prelim_revenue_ok = (rev is not None and rev > 0)
-            prelim_shares_ok = (shares is not None and shares > 0)
-            prelim_cash_or_ocf_ok = ((cash is not None and cash > 0) or (ocf is not None))
-
-            if not (prelim_revenue_ok and prelim_shares_ok and prelim_cash_or_ocf_ok):
-                # Fail Gate 2 without calling Yahoo
-                out.update({
-                    "P_Close_Price_USD": None,
-                    "P_Price_Date": None,
-                    "P_Market_Cap_USD": None,
-                    "P_MarketCap_Method": None,
-                })
-                g2_passed, _, g2_fields = gate2_basics(out)
-                out.update(g2_fields)
-                out["Status"] = "Excluded (Gate 2)"
-                out_rows.append(out)
-                continue
-
-            # Only now: compute market cap (Yahoo) and apply threshold
-            out.update(compute_market_cap_from_out(out, t))
             g2_passed, _, g2_fields = gate2_basics(out)
             out.update(g2_fields)
 
             if ENABLE_GATE_2 and not g2_passed:
                 out["Status"] = "Excluded (Gate 2)"
+                out.update({
+                    "G3_Pass": "FALSE",
+                    "G3_Reason": "FAIL: Gate 2 failed",
+                    # Ensure no market fields for excluded Gate 2
+                    "P_Close_Price_USD": None,
+                    "P_Price_Date": None,
+                    "P_Market_Cap_USD": None,
+                    "P_MarketCap_Method": None,
+                    "P_ADV30_Shares": None,
+                    "P_ADV30_Dollar": None,
+                })
                 out_rows.append(out)
                 continue
 
             # -----------------------------
-            # Tiers (only for Gate-2 passers)
+            # Gate 3 (Yahoo fetched LAST, tight)
+            # -----------------------------
+            if ENABLE_GATE_3:
+                g3_passed, _, g3_fields = gate3_marketcap_and_liquidity(out, t)
+                out.update(g3_fields)
+                if not g3_passed:
+                    out["Status"] = "Excluded (Gate 3)"
+                    out_rows.append(out)
+                    continue
+
+            # -----------------------------
+            # Tiers (only for Gate-3 passers)
             # -----------------------------
 
-            # Tier C (submissions-derived signals)
             tier_c: Dict[str, Any] = {}
             if ENABLE_TIER_C:
                 try:
@@ -1495,14 +1562,12 @@ def main() -> None:
                 except Exception:
                     out["Status"] = "OK (Tier C partial)"
 
-            # Tier A full (reuse facts)
             if ENABLE_TIER_A_FULL:
                 try:
                     out.update(tier_a_full_metrics(facts))
                 except Exception:
                     out["Status"] = "OK (Tier A full partial)"
 
-            # Tier B (Form 4 parsing) needs tier_c internals
             if ENABLE_TIER_B and tier_c:
                 try:
                     b = tier_b_metrics_from_recent_forms(cik10, tier_c)
@@ -1510,7 +1575,7 @@ def main() -> None:
                 except Exception:
                     out["Status"] = out.get("Status") or "OK (Tier B partial)"
 
-            # Example derived flags (kept, but only after gates)
+            # Example derived flags (kept, only after gates)
             try:
                 ttm_rev2 = safe_float(out.get("A_TTM_Revenue_USD"))
                 out["F_TTM_Revenue_lt_500m"] = (
@@ -1573,22 +1638,10 @@ def main() -> None:
             out.update({
                 "G1_Pass_Reporting": "FALSE",
                 "G1_Reason": "FAIL: Unexpected error",
-                "G1_Latest_10K": None,
-                "G1_Latest_10Q": None,
-                "G1_Latest_20F": None,
-
                 "G2_Pass_Basics": "FALSE",
                 "G2_Reason": "FAIL: Unexpected error",
-                "G2_Revenue_Positive": None,
-                "G2_Shares_Exists": None,
-                "G2_CashOrOCF_Exists": None,
-                "G2_MarketCap_Over_10B": None,
-                "G2_MarketCap_USD": None,
-
-                "P_Close_Price_USD": None,
-                "P_Price_Date": None,
-                "P_Market_Cap_USD": None,
-                "P_MarketCap_Method": None,
+                "G3_Pass": "FALSE",
+                "G3_Reason": "FAIL: Unexpected error",
             })
             out_rows.append(out)
 

@@ -1211,7 +1211,6 @@ BASE_HEADERS = [
     "CIK",
     "SIC",
     "SIC Description",
-    "Aerospace & Defense",
     "Data As-Of Date",
     "Run Timestamp (UTC)",
     "Status",
@@ -1388,7 +1387,6 @@ def build_base_row(
     name: Optional[str],
     sic: Optional[int],
     sic_desc: Optional[str],
-    is_ad: Optional[bool],
     *,
     status: str,
     as_of: str,
@@ -1433,7 +1431,6 @@ def main() -> None:
                 name=None,
                 sic=None,
                 sic_desc=None,
-                is_ad=None,
                 status="Ticker not found in SEC ticker map",
                 as_of=as_of,
             )
@@ -1462,7 +1459,6 @@ def main() -> None:
                     name=name,
                     sic=None,
                     sic_desc=None,
-                    is_ad=None,
                     status="No submissions JSON",
                     as_of=as_of,
                 )
@@ -1482,7 +1478,7 @@ def main() -> None:
                 continue
 
             sic, sic_desc = extract_sic(submissions)
-            is_ad = None
+
 
             out = build_base_row(
                 ticker=t,
@@ -1490,7 +1486,6 @@ def main() -> None:
                 name=name,
                 sic=sic,
                 sic_desc=sic_desc,
-                is_ad=is_ad,
                 status="OK",
                 as_of=as_of,
             )
@@ -1653,7 +1648,6 @@ def main() -> None:
                 name=name,
                 sic=None,
                 sic_desc=None,
-                is_ad=None,
                 status="Failed (unexpected error in company loop)",
                 as_of=as_of,
             )

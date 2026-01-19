@@ -1,23 +1,256 @@
 python3 - <<'PY'
 from pathlib import Path
 from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill
+from openpyxl.utils import get_column_letter
+from openpyxl.formatting.rule import FormulaRule, CellIsRule
 
 out = Path("data/defense_screening_prototype_v1.xlsx")
 out.parent.mkdir(parents=True, exist_ok=True)
 
+# -----------------------------
+# Header layout (3 sections)
+# -----------------------------
+HEADERS = [
+    # === Section 1: Quick feel (scan) ===
+    "Ticker",
+    "Company Name",
+    "Status",
+    "SIC Description",
+
+    "P_Market_Cap_USD",
+    "A_TTM_Revenue_USD",
+    "A_Revenue_YoY_Growth",
+    "A_Operating_Margin",
+    "P_ADV30_Dollar",
+
+    "P_Close_Price_USD",
+    "P_Price_Date",
+    "P_Volatility_30d",  # placeholder; you can compute later
+
+    # === Section 2: Deeper (still readable) ===
+    "A_Current_Ratio",
+    "A_Debt_to_Equity",
+    "A_RnD_Intensity",
+    "A_TTM_OCF_USD",
+    "A_TTM_FCF_USD",
+
+    # === Section 3: Deep analytics (collapsed by default) ===
+    "A_Cash_USD",
+    "A_Total_Debt_USD",
+    "A_Shares_Outstanding",
+    "A_Shares_AsOf",
+    "A_SGandA_Intensity",
+    "A_SBC_USD_Latest",
+    "A_TTM_Capex_USD",
+
+    # === Section 4: Gates + provenance + clutter (collapsed by default) ===
+    "G1_Pass_Reporting",
+    "G1_Reason",
+    "G1_Latest_10K",
+    "G1_Latest_10Q",
+    "G1_Latest_20F",
+
+    "G2_Pass_Basics",
+    "G2_Reason",
+    "G2_Size_OK",
+    "G2_Shares_OK",
+    "G2_Operating_Exists",
+    "G2_CashOrOCF_OK",
+
+    "G3_Pass",
+    "G3_Reason",
+    "P_MarketCap_Method",
+    "P_ADV30_Shares",
+
+    "CIK",
+    "SIC",
+    "Data As-Of Date",
+    "Run Timestamp (UTC)",
+
+    # Common Tier C (filing signals) – keep in clutter
+    "C_10Q_Count_365d",
+    "C_10K_Count_365d",
+    "C_8K_Count_365d",
+    "C_S1_or_S3_Count_365d",
+    "C_424B_Count_365d",
+    "C_13D_13G_Count_365d",
+    "C_Form4_Count_90d",
+    "C_Latest_10Q_Date",
+    "C_Latest_10K_Date",
+    "C_Latest_Shelf_Date",
+    "C_Latest_Form4_Date",
+    "C_Recent_Filings_Listed",
+
+    # Common Tier B (Form 4 parsing) – keep in clutter
+    "B_Form4_Net_Shares_180d",
+    "B_Form4_Tx_Count_180d",
+    "B_Form4_Last_Date_Parsed",
+
+    # Your derived flags (if present) – keep in clutter
+    "F_TTM_Revenue_lt_500m",
+    "F_YoY_Abs_gt_40pct",
+    "F_OpMargin_lt_neg10pct",
+    "F_RnD_gt_20pct",
+    "F_SGandA_gt_50pct",
+    "F_CurrentRatio_lt_1_5",
+    "F_DebtEq_gt_1_0",
+]
+
+COL = {h: i+1 for i, h in enumerate(HEADERS)}
+
 wb = Workbook()
 ws = wb.active
 ws.title = "Universe"
+ws.append(HEADERS)
 
-ws.append([
-    "Ticker",
-    "Company Name",
-    "CIK",
-    "SIC",
-    "SIC Description",
-    "Data As-Of Date"
-])
+# -----------------------------
+# Header styling
+# -----------------------------
+header_fill = PatternFill("solid", fgColor="1F2937")  # dark gray
+header_font = Font(bold=True, color="FFFFFF")
+header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+ws.row_dimensions[1].height = 28
+for c in range(1, len(HEADERS) + 1):
+    cell = ws.cell(row=1, column=c)
+    cell.fill = header_fill
+    cell.font = header_font
+    cell.alignment = header_align
+
+# -----------------------------
+# Freeze panes + autofilter
+# Freeze first 4 columns + header row: set top-left scroll cell to E2
+# -----------------------------
+ws.freeze_panes = "E2"
+ws.auto_filter.ref = f"A1:{get_column_letter(len(HEADERS))}1"
+
+# -----------------------------
+# Column widths (practical defaults)
+# -----------------------------
+def set_w(col_name, width):
+    ws.column_dimensions[get_column_letter(COL[col_name])].width = width
+
+set_w("Ticker", 10)
+set_w("Company Name", 32)
+set_w("Status", 18)
+set_w("SIC Description", 28)
+
+for name in [
+    "P_Market_Cap_USD","A_TTM_Revenue_USD","P_ADV30_Dollar","A_TTM_OCF_USD","A_TTM_FCF_USD",
+    "A_Cash_USD","A_Total_Debt_USD","A_Shares_Outstanding","A_TTM_Capex_USD","P_Close_Price_USD",
+]:
+    if name in COL:
+        set_w(name, 16)
+
+for name in ["A_Revenue_YoY_Growth","A_Operating_Margin","A_Current_Ratio","A_Debt_to_Equity","A_RnD_Intensity","A_SGandA_Intensity"]:
+    if name in COL:
+        set_w(name, 14)
+
+for name in ["G1_Reason","G2_Reason","G3_Reason"]:
+    if name in COL:
+        set_w(name, 34)
+
+# -----------------------------
+# Number formats
+# -----------------------------
+CURRENCY0 = '"$"#,##0'
+CURRENCY2 = '"$"#,##0.00'
+PCT2 = '0.00%'
+NUM2 = '0.00'
+INT0 = '#,##0'
+
+def fmt(col_name, number_format):
+    if col_name not in COL:
+        return
+    c = COL[col_name]
+    for r in range(2, 1002):  # pre-format first 1000 rows (Excel-friendly; scraper writes beyond fine)
+        ws.cell(row=r, column=c).number_format = number_format
+
+for name in ["P_Market_Cap_USD","A_TTM_Revenue_USD","P_ADV30_Dollar","A_TTM_OCF_USD","A_TTM_FCF_USD","A_Cash_USD","A_Total_Debt_USD","A_TTM_Capex_USD","P_ADV30_Shares"]:
+    if name in COL:
+        fmt(name, CURRENCY0 if "USD" in name or "Dollar" in name or "Cap" in name else INT0)
+
+fmt("P_Close_Price_USD", CURRENCY2)
+fmt("A_Revenue_YoY_Growth", PCT2)
+fmt("A_Operating_Margin", PCT2)
+fmt("A_RnD_Intensity", PCT2)
+fmt("A_SGandA_Intensity", PCT2)
+fmt("A_Current_Ratio", NUM2)
+fmt("A_Debt_to_Equity", NUM2)
+fmt("P_Volatility_30d", PCT2)
+
+# -----------------------------
+# Column grouping (collapse by default)
+# Section 3: deep analytics; Section 4: gates/clutter
+# -----------------------------
+def group_cols(start_name, end_name, hidden=True):
+    start = COL[start_name]
+    end = COL[end_name]
+    ws.column_dimensions.group(
+        get_column_letter(start),
+        get_column_letter(end),
+        hidden=hidden,
+        outline_level=1
+    )
+
+# Collapse deep analytics
+group_cols("A_Cash_USD", "A_TTM_Capex_USD", hidden=True)
+# Collapse gates/clutter
+group_cols("G1_Pass_Reporting", "F_DebtEq_gt_1_0", hidden=True)
+
+ws.sheet_properties.outlinePr.summaryBelow = False
+
+# -----------------------------
+# Conditional formatting (clean + readable)
+# -----------------------------
+# Helpers
+GREEN = PatternFill("solid", fgColor="C6EFCE")
+RED = PatternFill("solid", fgColor="FFC7CE")
+ORANGE = PatternFill("solid", fgColor="FFEB9C")
+
+max_row = 5000  # apply rules over a reasonable range
+
+def col_range(name):
+    col = get_column_letter(COL[name])
+    return f"{col}2:{col}{max_row}"
+
+# Status: OK green, Excluded red
+if "Status" in COL:
+    rng = col_range("Status")
+    ws.conditional_formatting.add(rng, FormulaRule(formula=[f'ISNUMBER(SEARCH("OK",${get_column_letter(COL["Status"])}2))'], fill=GREEN))
+    ws.conditional_formatting.add(rng, FormulaRule(formula=[f'ISNUMBER(SEARCH("Excluded",${get_column_letter(COL["Status"])}2))'], fill=RED))
+
+# G3_Pass TRUE/FALSE
+if "G3_Pass" in COL:
+    rng = col_range("G3_Pass")
+    ws.conditional_formatting.add(rng, FormulaRule(formula=[f'${get_column_letter(COL["G3_Pass"])}2="TRUE"'], fill=GREEN))
+    ws.conditional_formatting.add(rng, FormulaRule(formula=[f'${get_column_letter(COL["G3_Pass"])}2="FALSE"'], fill=RED))
+
+# Market cap: <1B green, >5B orange
+if "P_Market_Cap_USD" in COL:
+    rng = col_range("P_Market_Cap_USD")
+    ws.conditional_formatting.add(rng, CellIsRule(operator="lessThan", formula=["1000000000"], fill=GREEN))
+    ws.conditional_formatting.add(rng, CellIsRule(operator="greaterThan", formula=["5000000000"], fill=ORANGE))
+
+# YoY growth: >30% green, <0 red
+if "A_Revenue_YoY_Growth" in COL:
+    rng = col_range("A_Revenue_YoY_Growth")
+    ws.conditional_formatting.add(rng, CellIsRule(operator="greaterThan", formula=["0.30"], fill=GREEN))
+    ws.conditional_formatting.add(rng, CellIsRule(operator="lessThan", formula=["0"], fill=RED))
+
+# Operating margin: >10% green, <0 red
+if "A_Operating_Margin" in COL:
+    rng = col_range("A_Operating_Margin")
+    ws.conditional_formatting.add(rng, CellIsRule(operator="greaterThan", formula=["0.10"], fill=GREEN))
+    ws.conditional_formatting.add(rng, CellIsRule(operator="lessThan", formula=["0"], fill=RED))
+
+# $ADV30: <2m red, >10m green
+if "P_ADV30_Dollar" in COL:
+    rng = col_range("P_ADV30_Dollar")
+    ws.conditional_formatting.add(rng, CellIsRule(operator="lessThan", formula=["2000000"], fill=RED))
+    ws.conditional_formatting.add(rng, CellIsRule(operator="greaterThan", formula=["10000000"], fill=GREEN))
 
 wb.save(out)
-print("Created:", out.resolve())
+print("Created formatted template:", out.resolve())
 PY

@@ -1,4 +1,3 @@
-python3 - <<'PY'
 from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill
@@ -122,4 +121,3 @@ if "P_ADV30_Dollar" in COL:
 
 wb.save(out)
 print("Created template:", out.resolve())
-PY

@@ -4,7 +4,9 @@ from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.formatting.rule import FormulaRule, CellIsRule
 
-out = Path("data/defense_screening_prototype_v1.xlsx")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+out = REPO_ROOT / "data" / "defense_screening_prototype_v1.xlsx"
+out.parent.mkdir(parents=True, exist_ok=True)
 out.parent.mkdir(parents=True, exist_ok=True)
 
 HEADERS = [

@@ -113,10 +113,10 @@ G3_MAX_MARKET_CAP_USD = 5_000_000_000
 G3_MIN_ADV30_SHARES = 200_000
 G3_MIN_ADV30_DOLLAR = 2_000_000
 
-# Switches: tiers (only run after gates pass)
-ENABLE_TIER_A_FULL = True
-ENABLE_TIER_B = True   # Form 4 parsing (best-effort)
-ENABLE_TIER_C = True
+# Switches: tiers 
+ENABLE_TIER_A_FULL = False
+ENABLE_TIER_B = False   
+ENABLE_TIER_C = False
 
 
 # -----------------------------

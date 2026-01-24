@@ -106,7 +106,7 @@ for c in range(1, len(HEADERS) + 1):
     cell.alignment = header_align
 
 # Freeze panes: keep Intro visible while scrolling
-ws.freeze_panes = "E2"  # freezes A-D + row 1
+ws.freeze_panes = "F2"  # freezes A-D + row 1
 
 # Filter
 ws.auto_filter.ref = f"A1:{get_column_letter(len(HEADERS))}1"

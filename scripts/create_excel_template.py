@@ -12,6 +12,7 @@ out.parent.mkdir(parents=True, exist_ok=True)
 INTRO_HEADERS = [
     "Ticker",
     "Company Name",
+    "Outcome",
     "Sector",
     "Industry",
 ]
@@ -118,6 +119,7 @@ def set_w(name, w):
 # Intro
 set_w("Ticker", 10)
 set_w("Company Name", 34)
+set_w("Outcome", 14)
 set_w("Sector", 20)
 set_w("Industry", 26)
 

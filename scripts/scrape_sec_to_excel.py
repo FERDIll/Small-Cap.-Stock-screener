@@ -860,6 +860,7 @@ def gate3_marketcap_and_liquidity(out: Dict[str, Any], ticker: str) -> Tuple[boo
 INTRO_HEADERS = [
     "Ticker",
     "Company Name",
+    "Outcome",
     "Sector",
     "Industry",
 ]
@@ -1059,11 +1060,27 @@ def build_base_row(
     as_of: str,
 ) -> Dict[str, Any]:
     sector = sic_to_sector(sic)
-    industry = sic_desc  # user-facing label; SIC code itself is clutter
+    industry = sic_desc
+
+    # NEW: short, human-readable outcome (Intro)
+    outcome = status
+    if isinstance(status, str):
+        if status.startswith("Excluded (Gate 1)"):
+            outcome = "Excluded (G1)"
+        elif status.startswith("Excluded (Gate 2)"):
+            outcome = "Excluded (G2)"
+        elif status.startswith("Excluded (Gate 3)"):
+            outcome = "Excluded (G3)"
+        elif status == "OK":
+            outcome = "PASS"
+        elif "Ticker not found" in status:
+            outcome = "No CIK"
+
     return {
         # Intro
         "Ticker": ticker,
         "Company Name": company_name,
+        "Outcome": outcome,   # NEW
         "Sector": sector,
         "Industry": industry,
 

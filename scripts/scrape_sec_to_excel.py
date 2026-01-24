@@ -981,13 +981,20 @@ def ensure_columns(ws: Worksheet, header_row: int, header_map: Dict[str, int], c
 
 def build_ticker_row_index(ws: Worksheet, header_row: int, ticker_col: int) -> Dict[str, int]:
     idx: Dict[str, int] = {}
-    for r in range(header_row + 1, ws.max_row + 1):
+    r = header_row + 1
+    blanks_in_a_row = 0
+    while r <= ws.max_row:
         v = ws.cell(row=r, column=ticker_col).value
-        if not v:
-            continue
-        t = str(v).strip().upper()
-        if t:
-            idx[t] = r
+        if v in (None, ""):
+            blanks_in_a_row += 1
+            if blanks_in_a_row >= 50:   # stop after a reasonable blank run
+                break
+        else:
+            blanks_in_a_row = 0
+            t = str(v).strip().upper()
+            if t:
+                idx[t] = r
+        r += 1
     return idx
 
 
@@ -1008,9 +1015,13 @@ def write_company_dicts_to_excel(xlsx_path: Path, rows: List[Dict[str, Any]]) ->
 
     existing = build_ticker_row_index(ws, header_row, ticker_col)
 
-    append_row = ws.max_row + 1
-    while ws.cell(row=append_row, column=ticker_col).value not in (None, ""):
+    append_row = header_row + 1
+    while True:
+        v = ws.cell(row=append_row, column=ticker_col).value
+        if v in (None, ""):
+            break
         append_row += 1
+
 
     for rd in rows:
         ticker = str(rd.get("Ticker") or "").strip().upper()

@@ -1095,6 +1095,26 @@ def build_base_row(
         "Status": status,
     }
 
+def outcome_from_status(status: Optional[str]) -> Optional[str]:
+    s = (status or "").strip()
+    if not s:
+        return None
+    if s.startswith("Excluded (Gate 1)"):
+        return "Excluded (G1)"
+    if s.startswith("Excluded (Gate 2)"):
+        return "Excluded (G2)"
+    if s.startswith("Excluded (Gate 3)"):
+        return "Excluded (G3)"
+    if "Ticker not found" in s:
+        return "No CIK"
+    if s == "No submissions JSON":
+        return "No submissions"
+    if s == "OK":
+        return "PASS"
+    if "Failed" in s or "error" in s.lower():
+        return "Error"
+    return s
+
 
 def main() -> None:
     ensure_output_workbook()
